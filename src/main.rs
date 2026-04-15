@@ -27,8 +27,21 @@ pub struct GetTaskRequest {
     pub task_id: String,
 }
 
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct WaitForTaskRequest {
+    /// The task_id to wait for.
+    pub task_id: String,
+    /// Maximum seconds to wait before returning a timeout error. Default: 600.
+    #[serde(default = "default_timeout")]
+    pub timeout_secs: u64,
+}
+
 fn default_profile() -> String {
     "anthropic".to_string()
+}
+
+fn default_timeout() -> u64 {
+    600
 }
 
 #[derive(Clone)]
@@ -97,6 +110,51 @@ impl WardenServer {
                 None => format!("task '{}' not found", req.task_id),
                 Some(kv) => kv.value_str().unwrap_or("(invalid utf-8)").to_string(),
             },
+        }
+    }
+
+    /// Block until a task reaches a terminal state (completed or failed).
+    /// Polls etcd every 2 seconds. Returns the final task JSON.
+    #[tool(
+        name = "wait_for_task",
+        description = "Block until a task completes or fails. Returns the final task JSON. Use this after spawn_agent to chain dependent tasks."
+    )]
+    async fn wait_for_task(&self, Parameters(req): Parameters<WaitForTaskRequest>) -> String {
+        let key = format!("/warden/tasks/{}", req.task_id);
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_secs(req.timeout_secs);
+
+        loop {
+            // Poll etcd — release the lock between iterations so other tools aren't blocked.
+            let value = {
+                let mut client = self.etcd.lock().await;
+                match client.get(key.clone(), None).await {
+                    Err(e) => return format!("etcd error: {}", e),
+                    Ok(resp) => resp
+                        .kvs()
+                        .first()
+                        .and_then(|kv| kv.value_str().ok())
+                        .map(|s| s.to_string()),
+                }
+            };
+
+            if let Some(json) = value {
+                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&json) {
+                    let status = obj.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                    if matches!(status, "completed" | "failed" | "orphaned") {
+                        return json;
+                    }
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return format!(
+                    "{{\"error\": \"timeout\", \"task_id\": \"{}\", \"timeout_secs\": {}}}",
+                    req.task_id, req.timeout_secs
+                );
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
         }
     }
 }
