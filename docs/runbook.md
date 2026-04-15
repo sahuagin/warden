@@ -52,14 +52,24 @@ doas /usr/sbin/jexec -U tcovert <jail_name> /bin/sh -c 'ps aux'  # check process
 
 ## Cleaning up orphaned jails
 
-If warden exits mid-task, jails and ZFS snapshots are left behind:
+If warden exits mid-task, jails and ZFS snapshots are left behind. Use `warden-cleanup` (from HOST):
 
 ```sh
-# Stop the jail
-doas /usr/sbin/jail -f ~/.config/warden/jails/<jail_name>.conf -r <jail_name>
+./target/debug/warden-cleanup            # list orphans, prompt before destroying
+./target/debug/warden-cleanup --dry-run  # list only, no changes
+./target/debug/warden-cleanup --yes      # destroy without prompting
+```
+
+Handles running jails, missing snapshots (partial creates), and missing conf files automatically.
+
+### Manual cleanup (if needed)
+
+```sh
+# Stop the jail (no conf file required if jail is running)
+doas /usr/sbin/jail -r <jail_name>
 
 # Destroy the ZFS clone and snapshot
-zfs destroy zroot/jails/<jail_name>
+zfs destroy -f zroot/jails/<jail_name>
 zfs destroy zroot/jails/warden@<jail_name>
 
 # Remove the config file
@@ -93,5 +103,5 @@ Note: `zfs set mountpoint` still requires doas `/sbin/zfs` because it mounts the
 ## Known issues
 
 - `cannot mount '/usr/jails/warden-<name>'` — harmless warning, appears before doas zfs sets correct mountpoint
-- Orphaned jails if warden exits mid-task — clean up manually (see above)
+- Orphaned jails if warden exits mid-task — run `warden-cleanup` (see above)
 - gemma-4-31b via openrouter is slow (~5-10min) — use minimax for dev testing
