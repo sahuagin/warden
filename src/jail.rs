@@ -186,14 +186,25 @@ pub async fn stop(handle: &JailHandle) -> Result<()> {
 pub async fn destroy(handle: &JailHandle) -> Result<()> {
     let snapshot = format!("{}@{}", BASE_DATASET, handle.jail_name);
 
-    // Destroy the clone dataset
-    let status = Command::new("zfs")
-        .args(["destroy", &handle.dataset])
-        .status()
-        .await
-        .context("zfs destroy dataset")?;
-    if !status.success() {
-        bail!("zfs destroy failed for {}", handle.dataset);
+    // Destroy the clone dataset — use -f to forcibly unmount before destroy.
+    // Retry because devfs/nullfs mounts may still be settling after jail stop.
+    let mut destroyed = false;
+    for attempt in 0..10 {
+        let status = Command::new("zfs")
+            .args(["destroy", "-f", &handle.dataset])
+            .status()
+            .await
+            .context("zfs destroy dataset")?;
+        if status.success() {
+            destroyed = true;
+            break;
+        }
+        if attempt < 9 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+    }
+    if !destroyed {
+        bail!("zfs destroy failed for {} after retries", handle.dataset);
     }
 
     // Destroy the origin snapshot
