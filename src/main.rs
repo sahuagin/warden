@@ -1,3 +1,5 @@
+mod jail;
+
 use etcd_client::Client;
 use rmcp::{ServerHandler, ServiceExt, handler::server::wrapper::Parameters, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
@@ -37,6 +39,8 @@ impl WardenServer {
     )]
     async fn spawn_agent(&self, Parameters(req): Parameters<SpawnAgentRequest>) -> String {
         let key = format!("/warden/tasks/{}", req.task_id);
+
+        // Write task as pending
         let value = serde_json::json!({
             "task_id": req.task_id,
             "description": req.description,
@@ -46,11 +50,48 @@ impl WardenServer {
         })
         .to_string();
 
-        let mut client = self.etcd.lock().await;
-        match client.put(key.clone(), value, None).await {
-            Ok(_) => format!("Task {} queued with profile '{}'", req.task_id, req.model_profile),
-            Err(e) => format!("Failed to queue task {}: {}", req.task_id, e),
+        {
+            let mut client = self.etcd.lock().await;
+            if let Err(e) = client.put(key.clone(), value, None).await {
+                return format!("Failed to queue task {}: {}", req.task_id, e);
+            }
         }
+
+        // Create jail
+        let handle = match jail::create(&req.task_id).await {
+            Ok(h) => h,
+            Err(e) => {
+                return format!("Failed to create jail for task {}: {}", req.task_id, e);
+            }
+        };
+
+        // Start jail
+        if let Err(e) = jail::start(&handle).await {
+            let _ = jail::destroy(&handle).await;
+            return format!("Failed to start jail for task {}: {}", req.task_id, e);
+        }
+
+        // Update status to running
+        let value = serde_json::json!({
+            "task_id": req.task_id,
+            "description": req.description,
+            "model_profile": req.model_profile,
+            "status": "running",
+            "jail": handle.jail_name,
+        })
+        .to_string();
+
+        {
+            let mut client = self.etcd.lock().await;
+            if let Err(e) = client.put(key.clone(), value, None).await {
+                return format!("Jail started but failed to update etcd: {}", e);
+            }
+        }
+
+        format!(
+            "Task {} running in jail '{}' with profile '{}'",
+            req.task_id, handle.jail_name, req.model_profile
+        )
     }
 }
 
