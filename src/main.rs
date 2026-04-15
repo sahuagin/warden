@@ -1,4 +1,4 @@
-use warden::{agent, config::Config, jail};
+use warden::{agent, cleanup, config::Config, jail};
 use etcd_client::Client;
 use rmcp::{ServerHandler, ServiceExt, handler::server::wrapper::Parameters, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
@@ -24,6 +24,12 @@ pub struct SpawnAgentRequest {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GetTaskRequest {
     /// The task_id to look up.
+    pub task_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct KillTaskRequest {
+    /// The task_id to cancel.
     pub task_id: String,
 }
 
@@ -156,6 +162,67 @@ impl WardenServer {
 
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
         }
+    }
+
+    /// Cancel an in-flight task: stop its jail, destroy the dataset, mark etcd as cancelled.
+    /// No-op if the task is already in a terminal state.
+    #[tool(
+        name = "kill_task",
+        description = "Cancel a running or pending task. Stops its jail and cleans up resources."
+    )]
+    async fn kill_task(&self, Parameters(req): Parameters<KillTaskRequest>) -> String {
+        let key = format!("/warden/tasks/{}", req.task_id);
+
+        // Read current state
+        let json = {
+            let mut client = self.etcd.lock().await;
+            match client.get(key.clone(), None).await {
+                Err(e) => return format!("etcd error: {}", e),
+                Ok(resp) => match resp.kvs().first() {
+                    None => return format!("task '{}' not found", req.task_id),
+                    Some(kv) => kv.value_str().unwrap_or("").to_string(),
+                },
+            }
+        };
+
+        let obj: serde_json::Value = match serde_json::from_str(&json) {
+            Ok(v) => v,
+            Err(_) => return format!("task '{}' has invalid state in etcd", req.task_id),
+        };
+
+        let status = obj.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        if matches!(status, "completed" | "failed" | "cancelled" | "orphaned") {
+            return format!("task '{}' already in terminal state: {}", req.task_id, status);
+        }
+
+        // Build an Orphan descriptor from etcd data and config.
+        let jail_name = obj
+            .get("jail")
+            .and_then(|s| s.as_str())
+            .unwrap_or(&format!("warden-{}", req.task_id))
+            .to_string();
+
+        let orphan = cleanup::Orphan {
+            jail_name: jail_name.clone(),
+            dataset: format!("{}/{}", self.cfg.jails_dataset, jail_name),
+            snapshot: format!("{}@{}", self.cfg.base_dataset, jail_name),
+            conf_path: std::path::PathBuf::from(&self.cfg.jail_conf_dir)
+                .join(format!("{}.conf", jail_name)),
+            jail_running: true, // attempt stop regardless; destroy_orphan handles the not-running case
+        };
+
+        if let Err(e) = cleanup::destroy_orphan(&orphan, &self.cfg).await {
+            // Log the error but still mark cancelled in etcd.
+            eprintln!("kill_task: cleanup error for {}: {}", req.task_id, e);
+        }
+
+        // Mark as cancelled
+        let _ = self.write_etcd(&key, serde_json::json!({
+            "task_id": req.task_id,
+            "status": "cancelled",
+        })).await;
+
+        format!("task '{}' cancelled", req.task_id)
     }
 }
 
