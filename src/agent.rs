@@ -3,11 +3,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use std::process::Stdio;
 
-const CLAUDE_SCRIPT: &str = "/home/tcovert/src/claude-openrouter/claude-openrouter";
+use crate::config::Config;
 
 /// Run an agent inside the named jail and return its output.
-/// Pipes the prompt via stdin to claude-openrouter in non-interactive mode.
-pub async fn run(jail_name: &str, model_profile: &str, prompt: &str) -> Result<String> {
+/// Pipes the prompt via stdin to the configured claude script in non-interactive mode.
+pub async fn run(jail_name: &str, model_profile: &str, prompt: &str, cfg: &Config) -> Result<String> {
     let profile_arg = match model_profile {
         "minimax" => "minimax",
         _         => "paid",
@@ -18,7 +18,7 @@ pub async fn run(jail_name: &str, model_profile: &str, prompt: &str) -> Result<S
             "/usr/sbin/jexec",
             "-U", "tcovert",
             jail_name,
-            CLAUDE_SCRIPT,
+            &cfg.claude_script,
             profile_arg,
             "-p",
             "--dangerously-skip-permissions",

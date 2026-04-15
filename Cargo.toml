@@ -14,6 +14,7 @@ path = "src/bin/test_spawn.rs"
 [dependencies]
 anyhow = "1.0.102"
 etcd-client = "0.18.0"
+figment = { version = "0.10.19", features = ["toml", "env"] }
 rmcp = { version = "1.4.0", features = ["server", "transport-io", "schemars"] }
 schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["derive"] }

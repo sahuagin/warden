@@ -1,4 +1,4 @@
-use warden::{agent, jail};
+use warden::{agent, config::Config, jail};
 use etcd_client::Client;
 use rmcp::{ServerHandler, ServiceExt, handler::server::wrapper::Parameters, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
@@ -34,6 +34,7 @@ fn default_profile() -> String {
 #[derive(Clone)]
 pub struct WardenServer {
     etcd: Arc<Mutex<Client>>,
+    cfg: Arc<Config>,
     /// Count of in-flight background tasks.
     active_tasks: Arc<AtomicUsize>,
     /// Notified when active_tasks drops to zero.
@@ -104,7 +105,7 @@ impl WardenServer {
     /// Full jail lifecycle for a task. Called from a background tokio task.
     async fn run_task(&self, req: SpawnAgentRequest, key: String) {
         // Create jail
-        let handle = match jail::create(&req.task_id).await {
+        let handle = match jail::create(&req.task_id, &self.cfg).await {
             Ok(h) => h,
             Err(e) => {
                 let _ = self.write_etcd(&key, serde_json::json!({
@@ -137,7 +138,7 @@ impl WardenServer {
         })).await;
 
         // Run agent inside jail
-        let result = match agent::run(&handle.jail_name, &req.model_profile, &req.description).await {
+        let result = match agent::run(&handle.jail_name, &req.model_profile, &req.description, &self.cfg).await {
             Ok(output) => output,
             Err(e) => format!("agent error: {}", e),
         };
@@ -168,16 +169,19 @@ impl ServerHandler for WardenServer {}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let etcd = Client::connect(["127.0.0.1:2379"], None).await?;
+    let cfg = Config::load()?;
+    let endpoints: Vec<&str> = cfg.etcd_endpoints.iter().map(String::as_str).collect();
+    let etcd = Client::connect(endpoints, None).await?;
+
+    let active_tasks = Arc::new(AtomicUsize::new(0));
+    let tasks_done = Arc::new(Notify::new());
 
     let server = WardenServer {
         etcd: Arc::new(Mutex::new(etcd)),
-        active_tasks: Arc::new(AtomicUsize::new(0)),
-        tasks_done: Arc::new(Notify::new()),
+        cfg: Arc::new(cfg),
+        active_tasks: active_tasks.clone(),
+        tasks_done: tasks_done.clone(),
     };
-
-    let active_tasks = server.active_tasks.clone();
-    let tasks_done = server.tasks_done.clone();
 
     let transport = rmcp::transport::stdio();
     server.serve(transport).await?.waiting().await?;

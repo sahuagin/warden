@@ -3,56 +3,33 @@ use std::path::PathBuf;
 use tokio::fs;
 use tokio::process::Command;
 
-const BASE_DATASET: &str = "zroot/jails/warden";
-const JAILS_DATASET: &str = "zroot/jails";
-const JAILS_PATH: &str = "/jails";
-const JAIL_CONF_DIR: &str = "/home/tcovert/.config/warden/jails";
-
-// nullfs mounts to include in every ephemeral jail
-const NULLFS_MOUNTS: &[(&str, &str, &str)] = &[
-    ("/home/tcovert/.ssh", "home/tcovert/.ssh", "ro"),
-    ("/home/tcovert/.config/jj", "home/tcovert/.config/jj", "rw"),
-    (
-        "/home/tcovert/.config/git",
-        "home/tcovert/.config/git",
-        "rw",
-    ),
-    ("/home/tcovert/.gitconfig", "home/tcovert/.gitconfig", "rw"),
-    (
-        "/home/tcovert/src/claude-openrouter",
-        "home/tcovert/src/claude-openrouter",
-        "ro",
-    ),
-    (
-        "/home/tcovert/.claude-openrouter",
-        "home/tcovert/.claude-openrouter",
-        "rw",
-    ),
-];
+use crate::config::Config;
 
 pub struct JailHandle {
     pub task_id: String,
     pub dataset: String,
     pub jail_name: String,
     pub conf_path: PathBuf,
+    /// Stored at create time so destroy can reconstruct the snapshot name.
+    pub base_dataset: String,
 }
 
 /// Write a jail(8) config file for this task jail.
-async fn write_conf(jail_name: &str, mountpoint: &str) -> Result<PathBuf> {
-    fs::create_dir_all(JAIL_CONF_DIR)
+async fn write_conf(cfg: &Config, jail_name: &str, mountpoint: &str) -> Result<PathBuf> {
+    fs::create_dir_all(&cfg.jail_conf_dir)
         .await
         .context("create jail conf dir")?;
 
-    let conf_path = PathBuf::from(JAIL_CONF_DIR).join(format!("{}.conf", jail_name));
+    let conf_path = PathBuf::from(&cfg.jail_conf_dir).join(format!("{}.conf", jail_name));
 
     let mut mounts = String::new();
-    for (host, rel, mode) in NULLFS_MOUNTS {
+    for m in &cfg.nullfs_mounts {
         mounts.push_str(&format!(
-            "  mount += \"{host} {mountpoint}/{rel} nullfs {mode} 0 0\";\n",
-            host = host,
+            "  mount += \"{host} {mountpoint}/{jail} nullfs {mode} 0 0\";\n",
+            host = m.host,
             mountpoint = mountpoint,
-            rel = rel,
-            mode = mode,
+            jail = m.jail,
+            mode = m.mode,
         ));
     }
 
@@ -71,11 +48,11 @@ async fn write_conf(jail_name: &str, mountpoint: &str) -> Result<PathBuf> {
 }
 
 /// Snapshot the base dataset and clone it for a new task jail.
-pub async fn create(task_id: &str) -> Result<JailHandle> {
+pub async fn create(task_id: &str, cfg: &Config) -> Result<JailHandle> {
     let jail_name = format!("warden-{}", task_id);
-    let snapshot = format!("{}@{}", BASE_DATASET, jail_name);
-    let dataset = format!("{}/{}", JAILS_DATASET, jail_name);
-    let mountpoint = format!("{}/{}", JAILS_PATH, jail_name);
+    let snapshot = format!("{}@{}", cfg.base_dataset, jail_name);
+    let dataset = format!("{}/{}", cfg.jails_dataset, jail_name);
+    let mountpoint = format!("{}/{}", cfg.jails_path, jail_name);
 
     // Snapshot the base
     let status = Command::new("zfs")
@@ -112,20 +89,25 @@ pub async fn create(task_id: &str) -> Result<JailHandle> {
         bail!("zfs set mountpoint failed for {}", dataset);
     }
 
-    // Create mount point directories that don't exist in the base clone
-    let mount_dirs = [
-        "home/tcovert/src/claude-openrouter",
-        "home/tcovert/.claude-openrouter",
-    ];
-    for dir in &mount_dirs {
-        fs::create_dir_all(format!("{}/{}", mountpoint, dir))
-            .await
-            .with_context(|| format!("create mountpoint dir {}", dir))?;
+    // Create mount point directories that don't exist in the base clone.
+    // Skip paths that already exist (e.g. files like .gitconfig cloned from the base).
+    for m in &cfg.nullfs_mounts {
+        let full = format!("{}/{}", mountpoint, m.jail);
+        if fs::metadata(&full).await.is_err() {
+            fs::create_dir_all(&full)
+                .await
+                .with_context(|| format!("create mountpoint dir {}", m.jail))?;
+        }
     }
 
-    // Disable services that should only run in the warden jail, not worker jails
+    // Disable services that should only run in the warden jail, not worker jails.
     let status = Command::new("doas")
-        .args(["/usr/sbin/sysrc", "-f", &format!("{}/etc/rc.conf", mountpoint), "etcd_enable=NO"])
+        .args([
+            "/usr/sbin/sysrc",
+            "-f",
+            &format!("{}/etc/rc.conf", mountpoint),
+            "etcd_enable=NO",
+        ])
         .status()
         .await
         .context("sysrc etcd_enable=NO")?;
@@ -134,13 +116,14 @@ pub async fn create(task_id: &str) -> Result<JailHandle> {
     }
 
     // Write jail config
-    let conf_path = write_conf(&jail_name, &mountpoint).await?;
+    let conf_path = write_conf(cfg, &jail_name, &mountpoint).await?;
 
     Ok(JailHandle {
         task_id: task_id.to_string(),
         dataset,
         jail_name,
         conf_path,
+        base_dataset: cfg.base_dataset.clone(),
     })
 }
 
@@ -184,7 +167,7 @@ pub async fn stop(handle: &JailHandle) -> Result<()> {
 
 /// Destroy the jail dataset and its origin snapshot.
 pub async fn destroy(handle: &JailHandle) -> Result<()> {
-    let snapshot = format!("{}@{}", BASE_DATASET, handle.jail_name);
+    let snapshot = format!("{}@{}", handle.base_dataset, handle.jail_name);
 
     // Destroy the clone dataset — use -f to forcibly unmount before destroy.
     // Retry because devfs/nullfs mounts may still be settling after jail stop.
