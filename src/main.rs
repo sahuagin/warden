@@ -1,5 +1,4 @@
-mod jail;
-
+use warden::{agent, jail};
 use etcd_client::Client;
 use rmcp::{ServerHandler, ServiceExt, handler::server::wrapper::Parameters, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
@@ -88,10 +87,32 @@ impl WardenServer {
             }
         }
 
-        format!(
-            "Task {} running in jail '{}' with profile '{}'",
-            req.task_id, handle.jail_name, req.model_profile
-        )
+        // Run agent inside jail
+        let result = match agent::run(&handle.jail_name, &req.model_profile, &req.description).await {
+            Ok(output) => output,
+            Err(e) => format!("agent error: {}", e),
+        };
+
+        // Stop and destroy jail
+        let _ = jail::stop(&handle).await;
+        let _ = jail::destroy(&handle).await;
+
+        // Write final result to etcd
+        let value = serde_json::json!({
+            "task_id": req.task_id,
+            "description": req.description,
+            "model_profile": req.model_profile,
+            "status": "completed",
+            "result": result,
+        })
+        .to_string();
+
+        {
+            let mut client = self.etcd.lock().await;
+            let _ = client.put(key, value, None).await;
+        }
+
+        format!("Task {} completed in jail '{}'", req.task_id, handle.jail_name)
     }
 }
 

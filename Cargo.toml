@@ -3,6 +3,14 @@ name = "warden"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "warden"
+path = "src/main.rs"
+
+[[bin]]
+name = "warden-test-spawn"
+path = "src/bin/test_spawn.rs"
+
 [dependencies]
 anyhow = "1.0.102"
 etcd-client = "0.18.0"

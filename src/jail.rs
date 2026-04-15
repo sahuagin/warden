@@ -3,17 +3,31 @@ use std::path::PathBuf;
 use tokio::fs;
 use tokio::process::Command;
 
-const BASE_DATASET: &str = "zroot/jails/spline";
+const BASE_DATASET: &str = "zroot/jails/warden";
 const JAILS_DATASET: &str = "zroot/jails";
 const JAILS_PATH: &str = "/jails";
 const JAIL_CONF_DIR: &str = "/home/tcovert/.config/warden/jails";
 
 // nullfs mounts to include in every ephemeral jail
 const NULLFS_MOUNTS: &[(&str, &str, &str)] = &[
-    ("/home/tcovert/.ssh",            "home/tcovert/.ssh",            "ro"),
-    ("/home/tcovert/.config/jj",      "home/tcovert/.config/jj",      "rw"),
-    ("/home/tcovert/.config/git",     "home/tcovert/.config/git",     "rw"),
-    ("/home/tcovert/.gitconfig",      "home/tcovert/.gitconfig",      "rw"),
+    ("/home/tcovert/.ssh", "home/tcovert/.ssh", "ro"),
+    ("/home/tcovert/.config/jj", "home/tcovert/.config/jj", "rw"),
+    (
+        "/home/tcovert/.config/git",
+        "home/tcovert/.config/git",
+        "rw",
+    ),
+    ("/home/tcovert/.gitconfig", "home/tcovert/.gitconfig", "rw"),
+    (
+        "/home/tcovert/src/claude-openrouter",
+        "home/tcovert/src/claude-openrouter",
+        "ro",
+    ),
+    (
+        "/home/tcovert/.claude-openrouter",
+        "home/tcovert/.claude-openrouter",
+        "rw",
+    ),
 ];
 
 pub struct JailHandle {
@@ -85,12 +99,38 @@ pub async fn create(task_id: &str) -> Result<JailHandle> {
 
     // Set mountpoint (requires root to create the mount directory)
     let status = Command::new("doas")
-        .args(["/sbin/zfs", "set", &format!("mountpoint={}", mountpoint), &dataset])
+        .args([
+            "/sbin/zfs",
+            "set",
+            &format!("mountpoint={}", mountpoint),
+            &dataset,
+        ])
         .status()
         .await
         .context("zfs set mountpoint")?;
     if !status.success() {
         bail!("zfs set mountpoint failed for {}", dataset);
+    }
+
+    // Create mount point directories that don't exist in the base clone
+    let mount_dirs = [
+        "home/tcovert/src/claude-openrouter",
+        "home/tcovert/.claude-openrouter",
+    ];
+    for dir in &mount_dirs {
+        fs::create_dir_all(format!("{}/{}", mountpoint, dir))
+            .await
+            .with_context(|| format!("create mountpoint dir {}", dir))?;
+    }
+
+    // Disable services that should only run in the warden jail, not worker jails
+    let status = Command::new("doas")
+        .args(["/usr/sbin/sysrc", "-f", &format!("{}/etc/rc.conf", mountpoint), "etcd_enable=NO"])
+        .status()
+        .await
+        .context("sysrc etcd_enable=NO")?;
+    if !status.success() {
+        bail!("sysrc etcd_enable=NO failed");
     }
 
     // Write jail config
