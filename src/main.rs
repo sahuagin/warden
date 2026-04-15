@@ -4,7 +4,8 @@ use rmcp::{ServerHandler, ServiceExt, handler::server::wrapper::Parameters, tool
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::{Mutex, Notify};
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SpawnAgentRequest {
@@ -20,6 +21,12 @@ pub struct SpawnAgentRequest {
     pub fallback_profiles: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GetTaskRequest {
+    /// The task_id to look up.
+    pub task_id: String,
+}
+
 fn default_profile() -> String {
     "anthropic".to_string()
 }
@@ -27,14 +34,19 @@ fn default_profile() -> String {
 #[derive(Clone)]
 pub struct WardenServer {
     etcd: Arc<Mutex<Client>>,
+    /// Count of in-flight background tasks.
+    active_tasks: Arc<AtomicUsize>,
+    /// Notified when active_tasks drops to zero.
+    tasks_done: Arc<Notify>,
 }
 
 #[tool_router]
 impl WardenServer {
     /// Spawn an agent to handle a task in an isolated jail.
+    /// Returns immediately with the task_id; use get_task to poll for completion.
     #[tool(
         name = "spawn_agent",
-        description = "Spawn an isolated agent to handle a task. Returns when the agent completes."
+        description = "Queue an isolated agent to handle a task. Returns immediately; use get_task to poll for results."
     )]
     async fn spawn_agent(&self, Parameters(req): Parameters<SpawnAgentRequest>) -> String {
         let key = format!("/warden/tasks/{}", req.task_id);
@@ -56,36 +68,73 @@ impl WardenServer {
             }
         }
 
+        // Spawn background task — lifecycle continues even if the MCP pipe closes.
+        self.active_tasks.fetch_add(1, Ordering::SeqCst);
+        let worker = self.clone();
+        let task_id = req.task_id.clone();
+        tokio::spawn(async move {
+            worker.run_task(req, key).await;
+            if worker.active_tasks.fetch_sub(1, Ordering::SeqCst) == 1 {
+                worker.tasks_done.notify_waiters();
+            }
+        });
+
+        format!("Task {} queued", task_id)
+    }
+
+    /// Get the current state of a task from etcd.
+    #[tool(
+        name = "get_task",
+        description = "Get the current status and result of a previously spawned task."
+    )]
+    async fn get_task(&self, Parameters(req): Parameters<GetTaskRequest>) -> String {
+        let key = format!("/warden/tasks/{}", req.task_id);
+        let mut client = self.etcd.lock().await;
+        match client.get(key, None).await {
+            Err(e) => format!("etcd error: {}", e),
+            Ok(resp) => match resp.kvs().first() {
+                None => format!("task '{}' not found", req.task_id),
+                Some(kv) => kv.value_str().unwrap_or("(invalid utf-8)").to_string(),
+            },
+        }
+    }
+}
+
+impl WardenServer {
+    /// Full jail lifecycle for a task. Called from a background tokio task.
+    async fn run_task(&self, req: SpawnAgentRequest, key: String) {
         // Create jail
         let handle = match jail::create(&req.task_id).await {
             Ok(h) => h,
             Err(e) => {
-                return format!("Failed to create jail for task {}: {}", req.task_id, e);
+                let _ = self.write_etcd(&key, serde_json::json!({
+                    "task_id": req.task_id,
+                    "status": "failed",
+                    "error": format!("create jail: {}", e),
+                })).await;
+                return;
             }
         };
 
         // Start jail
         if let Err(e) = jail::start(&handle).await {
             let _ = jail::destroy(&handle).await;
-            return format!("Failed to start jail for task {}: {}", req.task_id, e);
+            let _ = self.write_etcd(&key, serde_json::json!({
+                "task_id": req.task_id,
+                "status": "failed",
+                "error": format!("start jail: {}", e),
+            })).await;
+            return;
         }
 
         // Update status to running
-        let value = serde_json::json!({
+        let _ = self.write_etcd(&key, serde_json::json!({
             "task_id": req.task_id,
             "description": req.description,
             "model_profile": req.model_profile,
             "status": "running",
             "jail": handle.jail_name,
-        })
-        .to_string();
-
-        {
-            let mut client = self.etcd.lock().await;
-            if let Err(e) = client.put(key.clone(), value, None).await {
-                return format!("Jail started but failed to update etcd: {}", e);
-            }
-        }
+        })).await;
 
         // Run agent inside jail
         let result = match agent::run(&handle.jail_name, &req.model_profile, &req.description).await {
@@ -98,21 +147,19 @@ impl WardenServer {
         let _ = jail::destroy(&handle).await;
 
         // Write final result to etcd
-        let value = serde_json::json!({
+        let _ = self.write_etcd(&key, serde_json::json!({
             "task_id": req.task_id,
             "description": req.description,
             "model_profile": req.model_profile,
             "status": "completed",
             "result": result,
-        })
-        .to_string();
+        })).await;
+    }
 
-        {
-            let mut client = self.etcd.lock().await;
-            let _ = client.put(key, value, None).await;
-        }
-
-        format!("Task {} completed in jail '{}'", req.task_id, handle.jail_name)
+    async fn write_etcd(&self, key: &str, value: serde_json::Value) -> anyhow::Result<()> {
+        let mut client = self.etcd.lock().await;
+        client.put(key, value.to_string(), None).await?;
+        Ok(())
     }
 }
 
@@ -125,10 +172,20 @@ async fn main() -> anyhow::Result<()> {
 
     let server = WardenServer {
         etcd: Arc::new(Mutex::new(etcd)),
+        active_tasks: Arc::new(AtomicUsize::new(0)),
+        tasks_done: Arc::new(Notify::new()),
     };
+
+    let active_tasks = server.active_tasks.clone();
+    let tasks_done = server.tasks_done.clone();
 
     let transport = rmcp::transport::stdio();
     server.serve(transport).await?.waiting().await?;
+
+    // MCP pipe closed — wait for any in-flight background tasks to finish.
+    while active_tasks.load(Ordering::SeqCst) > 0 {
+        tasks_done.notified().await;
+    }
 
     Ok(())
 }

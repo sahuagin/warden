@@ -85,6 +85,11 @@ zfs allow tcovert create,clone,destroy,mount,mountpoint,snapshot zroot/jails
 
 Note: `zfs set mountpoint` still requires doas `/sbin/zfs` because it mounts the filesystem.
 
+## MCP tools
+
+- `spawn_agent` — queues a task and returns immediately with `"Task <id> queued"`. The jail lifecycle runs in a background tokio task. The warden process stays alive after the MCP pipe closes until all background tasks complete.
+- `get_task` — reads task status from etcd. Poll this after spawn_agent.
+
 ## Known issues
 
 - `cannot mount '/usr/jails/warden-<name>'` — harmless warning, appears before doas zfs sets correct mountpoint
