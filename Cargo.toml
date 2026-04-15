@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "warden-test-spawn"
 path = "src/bin/test_spawn.rs"
 
+[[bin]]
+name = "warden-cleanup"
+path = "src/bin/cleanup.rs"
+
 [dependencies]
 anyhow = "1.0.102"
 etcd-client = "0.18.0"
