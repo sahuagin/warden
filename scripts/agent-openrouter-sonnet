@@ -1,0 +1,10 @@
+#!/bin/sh
+# Spawn Claude Sonnet 4.6 via OpenRouter (through pi). Use sparingly — same cost as Anthropic direct.
+# Emergency fallback when Anthropic API has issues.
+# Passes all args through — add -p "prompt" for non-interactive use.
+OR_KEY=$(cat /home/tcovert/src/claude-openrouter/api-key)
+exec env OPENROUTER_API_KEY="$OR_KEY" \
+    /home/tcovert/.npm-packages/bin/pi \
+    --provider openrouter \
+    --model anthropic/claude-sonnet-4-6 \
+    "$@"
