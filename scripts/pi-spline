@@ -91,6 +91,8 @@ echo "==> Changes not pushed will be lost when you exit." >&2
 doas /usr/sbin/jexec -U tcovert "$JAIL_NAME" /usr/local/bin/zsh -c \
     'export OPENROUTER_API_KEY=$(cat ~/src/claude-openrouter/api-key)
      export PATH=$PATH:/home/tcovert/.npm-packages/bin
+     export EDITOR=hx
+     export VISUAL=hx
      cd ~/work/spline/jj_lseg
      pi --provider openrouter --model '"${PI_MODEL}"
 
