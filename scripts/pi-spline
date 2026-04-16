@@ -1,0 +1,98 @@
+#!/bin/sh
+# pi-spline: run pi in an ephemeral ZFS clone of the spline jail.
+#
+# Usage: pi-spline [gemma|minimax]   (default: gemma)
+#
+# Workflow:
+#   1. Snapshot zroot/jails/spline
+#   2. Clone it, mount it, start as a new jail
+#   3. Drop into an interactive pi session in ~/work/spline/jj_lseg
+#   4. On exit: stop jail, destroy clone + snapshot
+#
+# Push changes before exiting:
+#   jj git push --remote=local    → save to gitsah (NAS)
+#   jj git push --remote=origin   → publish to GitHub
+#
+# Requires doas rules: jail, zfs, jexec, mkdir, sh
+
+set -e
+
+MODEL="${1:-gemma}"
+case "$MODEL" in
+    gemma)   PI_MODEL="google/gemma-4-31b-it" ;;
+    minimax) PI_MODEL="minimax/minimax-m2.7" ;;
+    *)       echo "Unknown model: $MODEL. Use gemma or minimax." >&2; exit 1 ;;
+esac
+
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+BASE_DS="zroot/jails/spline"
+SNAP="${BASE_DS}@pi-${TIMESTAMP}"
+CLONE_DS="zroot/jails/spline-work-${TIMESTAMP}"
+CLONE_PATH="/jails/spline-work-${TIMESTAMP}"
+JAIL_NAME="spline-work-${TIMESTAMP}"
+CONF_FILE="/tmp/jail-${JAIL_NAME}.conf"
+
+cleanup() {
+    echo "==> Stopping jail $JAIL_NAME" >&2
+    doas /usr/sbin/jail -r "$JAIL_NAME" 2>/dev/null || true
+    echo "==> Destroying clone $CLONE_DS" >&2
+    doas /sbin/zfs destroy -f "$CLONE_DS" 2>/dev/null || true
+    echo "==> Destroying snapshot $SNAP" >&2
+    doas /sbin/zfs destroy "$SNAP" 2>/dev/null || true
+    rm -f "$CONF_FILE"
+    echo "==> Done." >&2
+}
+trap cleanup EXIT INT TERM
+
+echo "==> Snapshotting $BASE_DS" >&2
+doas /sbin/zfs snapshot "$SNAP"
+
+echo "==> Cloning to $CLONE_DS" >&2
+doas /sbin/zfs clone "$SNAP" "$CLONE_DS"
+doas /sbin/zfs set mountpoint="$CLONE_PATH" "$CLONE_DS"
+
+# Create mount targets for things not in the base spline jail
+doas /bin/mkdir -p "${CLONE_PATH}/home/tcovert/.npm-packages"
+doas /bin/mkdir -p "${CLONE_PATH}/home/tcovert/.pi"
+doas /bin/mkdir -p "${CLONE_PATH}/home/tcovert/src/claude-openrouter"
+
+cat > "$CONF_FILE" << EOF
+${JAIL_NAME} {
+  host.hostname = ${JAIL_NAME};
+  path = ${CLONE_PATH};
+  exec.start = "/bin/sh /etc/rc";
+  exec.stop = "/bin/sh /etc/rc.shutdown";
+  mount.devfs;
+
+  mount += "/home/tcovert/.claude ${CLONE_PATH}/home/tcovert/.claude nullfs rw 0 0";
+  mount += "/home/tcovert/.claude.json ${CLONE_PATH}/home/tcovert/.claude.json nullfs rw 0 0";
+  mount += "/home/tcovert/.config/jj ${CLONE_PATH}/home/tcovert/.config/jj nullfs rw 0 0";
+  mount += "/home/tcovert/.config/git ${CLONE_PATH}/home/tcovert/.config/git nullfs rw 0 0";
+  mount += "/home/tcovert/.config/helix ${CLONE_PATH}/home/tcovert/.config/helix nullfs rw 0 0";
+  mount += "/home/tcovert/.gitconfig ${CLONE_PATH}/home/tcovert/.gitconfig nullfs rw 0 0";
+  mount += "/home/tcovert/.ssh ${CLONE_PATH}/home/tcovert/.ssh nullfs ro 0 0";
+  mount += "/exports/home ${CLONE_PATH}/exports/home nullfs rw 0 0";
+  mount += "/home/tcovert/.npm-packages ${CLONE_PATH}/home/tcovert/.npm-packages nullfs ro 0 0";
+  mount += "/home/tcovert/.pi ${CLONE_PATH}/home/tcovert/.pi nullfs rw 0 0";
+  mount += "/home/tcovert/src/claude-openrouter ${CLONE_PATH}/home/tcovert/src/claude-openrouter nullfs ro 0 0";
+
+  allow.raw_sockets = 1;
+  ip4 = inherit;
+}
+EOF
+
+echo "==> Starting jail $JAIL_NAME" >&2
+doas /usr/sbin/jail -f "$CONF_FILE" -c "$JAIL_NAME"
+
+echo "==> Entering pi session (model: $MODEL)" >&2
+echo "==> To save work: jj git push --remote=local" >&2
+echo "==> Changes not pushed will be lost when you exit." >&2
+
+doas /usr/sbin/jexec -U tcovert "$JAIL_NAME" /usr/local/bin/zsh -c \
+    'export OPENROUTER_API_KEY=$(cat ~/src/claude-openrouter/api-key)
+     export PATH=$PATH:/home/tcovert/.npm-packages/bin
+     cd ~/work/spline/jj_lseg
+     pi --provider openrouter --model '"${PI_MODEL}"
+
+echo "==> Session ended." >&2
+# cleanup runs via trap
