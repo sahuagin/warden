@@ -14,6 +14,21 @@ async fn main() -> Result<()> {
 
     let cfg = Config::load()?;
 
+    eprintln!("==> Running agent (profile: {})", model_profile);
+    eprintln!("==> Prompt: {}", prompt);
+
+    if agent::is_host_executor(model_profile) {
+        eprintln!("==> Host executor — skipping jail lifecycle");
+        match agent::run("", model_profile, prompt, &cfg).await {
+            Ok(output) => {
+                eprintln!("==> Agent completed successfully");
+                println!("{}", output);
+            }
+            Err(e) => eprintln!("==> Agent error: {}", e),
+        }
+        return Ok(());
+    }
+
     eprintln!("==> Creating jail for task '{}'", task_id);
     let handle = jail::create(task_id, &cfg).await?;
     eprintln!("==> Jail dataset: {}", handle.dataset);
@@ -22,16 +37,12 @@ async fn main() -> Result<()> {
     jail::start(&handle).await?;
     eprintln!("==> Jail started");
 
-    eprintln!("==> Running agent (profile: {})", model_profile);
-    eprintln!("==> Prompt: {}", prompt);
     match agent::run(&handle.jail_name, model_profile, prompt, &cfg).await {
         Ok(output) => {
             eprintln!("==> Agent completed successfully");
             println!("{}", output);
         }
-        Err(e) => {
-            eprintln!("==> Agent error: {}", e);
-        }
+        Err(e) => eprintln!("==> Agent error: {}", e),
     }
 
     eprintln!("==> Stopping jail");
