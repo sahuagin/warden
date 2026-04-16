@@ -229,6 +229,30 @@ impl WardenServer {
 impl WardenServer {
     /// Full jail lifecycle for a task. Called from a background tokio task.
     async fn run_task(&self, req: SpawnAgentRequest, key: String) {
+        // Host-executor profiles (pi-gemma, pi-minimax) skip the jail lifecycle entirely.
+        if agent::is_host_executor(&req.model_profile) {
+            let _ = self.write_etcd(&key, serde_json::json!({
+                "task_id": req.task_id,
+                "description": req.description,
+                "model_profile": req.model_profile,
+                "status": "running",
+            })).await;
+
+            let result = match agent::run("", &req.model_profile, &req.description, &self.cfg).await {
+                Ok(output) => output,
+                Err(e) => format!("agent error: {}", e),
+            };
+
+            let _ = self.write_etcd(&key, serde_json::json!({
+                "task_id": req.task_id,
+                "description": req.description,
+                "model_profile": req.model_profile,
+                "status": "completed",
+                "result": result,
+            })).await;
+            return;
+        }
+
         // Create jail
         let handle = match jail::create(&req.task_id, &self.cfg).await {
             Ok(h) => h,

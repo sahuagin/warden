@@ -31,9 +31,41 @@ cargo build
 
 ```sh
 ./target/debug/warden-test-spawn <task_id> "<prompt>" <model_profile>
-# model_profile: openrouter | minimax
+# model_profile: openrouter | minimax | pi-gemma | pi-minimax
 # Example:
 ./target/debug/warden-test-spawn test-001 "say hello and report your hostname" minimax
+./target/debug/warden-test-spawn mon-001 "summarise the warden task list" pi-gemma
+```
+
+## Model profiles
+
+| Profile | Executor | Model | Use case |
+|---|---|---|---|
+| `anthropic` | jail | Claude Sonnet (via claude-openrouter) | Default; real work |
+| `openrouter` | jail | Gemma 4 31B (via claude-openrouter) | Cheaper jail tasks |
+| `minimax` | jail | MiniMax M2.7 (via claude-openrouter) | Cheap jail tasks |
+| `pi-gemma` | host | Gemma 4 31B (via pi) | Monitoring, triage — no jail |
+| `pi-minimax` | host | MiniMax M2.7 (via pi) | Monitoring, triage — no jail |
+
+Host-executor profiles (`pi-gemma`, `pi-minimax`) bypass jail creation entirely. The agent runs
+directly on threadripper. Appropriate for read-only monitoring tasks; not suitable for agents
+that write files or run tests.
+
+## Host agent scripts
+
+`scripts/` contains wrapper scripts for invoking agents directly from the host shell.
+Install to `~/.local/bin/`:
+
+```sh
+cp scripts/agent-gemma scripts/agent-minimax scripts/agent-personal ~/.local/bin/
+chmod +x ~/.local/bin/agent-gemma ~/.local/bin/agent-minimax ~/.local/bin/agent-personal
+```
+
+Usage:
+```sh
+agent-gemma -p "what is the status of the warden jail?"   # non-interactive
+agent-minimax -p "summarise recent errors in /var/log/messages"
+agent-personal --print "draft a PR description for this diff"
 ```
 
 ## Checking task state in etcd (from warden jail)

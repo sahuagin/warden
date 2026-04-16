@@ -1,0 +1,11 @@
+#!/bin/sh
+# Spawn a pi agent using MiniMax M2.7 via OpenRouter on the host.
+# Passes all args through — add -p "prompt" for non-interactive use.
+#
+# Install: cp scripts/agent-minimax ~/.local/bin/ && chmod +x ~/.local/bin/agent-minimax
+OR_KEY=$(cat /home/tcovert/src/claude-openrouter/api-key)
+exec env OPENROUTER_API_KEY="$OR_KEY" \
+    /home/tcovert/.npm-packages/bin/pi \
+    --provider openrouter \
+    --model minimax/minimax-m2.7 \
+    "$@"

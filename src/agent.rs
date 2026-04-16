@@ -5,9 +5,60 @@ use std::process::Stdio;
 
 use crate::config::Config;
 
-/// Run an agent inside the named jail and return its output.
-/// Pipes the prompt via stdin to the configured claude script in non-interactive mode.
+/// Returns true for profiles that run directly on the host (no jail).
+pub fn is_host_executor(profile: &str) -> bool {
+    matches!(profile, "pi-gemma" | "pi-minimax")
+}
+
+/// Run an agent: dispatches to jail or host executor based on the model profile.
 pub async fn run(jail_name: &str, model_profile: &str, prompt: &str, cfg: &Config) -> Result<String> {
+    if is_host_executor(model_profile) {
+        run_host(model_profile, prompt).await
+    } else {
+        run_in_jail(jail_name, model_profile, prompt, cfg).await
+    }
+}
+
+/// Host executor: runs pi directly on the host. No jail created or destroyed.
+/// Used for cheap monitoring/triage tasks (pi-gemma, pi-minimax).
+async fn run_host(model_profile: &str, prompt: &str) -> Result<String> {
+    let key_path = "/home/tcovert/src/claude-openrouter/api-key";
+    let or_key = std::fs::read_to_string(key_path)
+        .context("read openrouter api key")?;
+    let or_key = or_key.trim().to_string();
+
+    let model = match model_profile {
+        "pi-minimax" => "minimax/minimax-m2.7",
+        _            => "google/gemma-4-31b-it",
+    };
+
+    let child = Command::new("/home/tcovert/.npm-packages/bin/pi")
+        .args([
+            "--provider", "openrouter",
+            "--model", model,
+            "--no-context-files",
+            "-p", prompt,
+        ])
+        .env("OPENROUTER_API_KEY", or_key)
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin:/home/tcovert/.npm-packages/bin")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn pi agent")?;
+
+    let output = child.wait_with_output().await.context("wait for pi agent")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("pi agent exited with {}: {}", output.status, stderr.trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Jail executor: runs the agent inside the named jail via jexec.
+/// Pipes the prompt via stdin to the configured claude script in non-interactive mode.
+async fn run_in_jail(jail_name: &str, model_profile: &str, prompt: &str, cfg: &Config) -> Result<String> {
     let profile_arg = match model_profile {
         "minimax" => "minimax",
         _         => "paid",

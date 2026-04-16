@@ -1,0 +1,7 @@
+#!/bin/sh
+# Spawn a claude-personal (tcovert@sahuagin.net) session on the host.
+# Passes all args through — add -p/--print for non-interactive use.
+#
+# Install: cp scripts/agent-personal ~/.local/bin/ && chmod +x ~/.local/bin/agent-personal
+exec env CLAUDE_CONFIG_DIR=/home/tcovert/.claude-personal \
+    /home/tcovert/.npm-packages/bin/claude "$@"
