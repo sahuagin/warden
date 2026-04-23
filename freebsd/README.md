@@ -20,10 +20,8 @@ then install the service script and enable it:
 ```sh
 sudo install -m 555 -o root -g wheel freebsd/rc.d/claude_proxy /usr/local/etc/rc.d/claude_proxy
 
-sudo sh -c 'cat >> /etc/rc.conf <<EOF
-claude_proxy_enable="YES"
-claude_proxy_user="<your-username>"
-EOF'
+sudo sysrc claude_proxy_enable="YES" claude_proxy_user="<your-username>"
+# (or edit /etc/rc.conf directly if you prefer)
 
 sudo service claude_proxy start
 sudo service claude_proxy status
