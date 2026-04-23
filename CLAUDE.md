@@ -100,6 +100,8 @@ claude-proxy is **infrastructure under** warden, not a peer. It sits on the wire
 - Not an MCP tool. It has no `rmcp` dependencies.
 - Not a replacement for warden's orchestration — warden decides *which agent runs where*; claude-proxy decides *which Anthropic endpoint answers*.
 
+**Service deployment:** see `freebsd/README.md`. Ships a generic `rc.d/claude_proxy` script that runs the proxy as a `claude_proxy_user` of your choice, auto-restarts on crash, and auto-starts on boot. Required for `anthropic-oauth` to work across reboots.
+
 ## Deployment plan (phased, non-destructive)
 
 **Phase 1 (this commit): feature parity on the bench.** ✓ DONE

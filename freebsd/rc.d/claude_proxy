@@ -1,0 +1,66 @@
+#!/bin/sh
+#
+# PROVIDE: claude_proxy
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# Add the following to /etc/rc.conf to enable claude-proxy:
+#
+#   claude_proxy_enable="YES"
+#   claude_proxy_user="<the user whose ~/.claude*/.credentials.json the proxy reads>"
+#
+# All other settings have sensible defaults derived from claude_proxy_user.
+# Override any of the following in /etc/rc.conf if needed:
+#
+#   claude_proxy_home="/home/${claude_proxy_user}"
+#   claude_proxy_command="${claude_proxy_home}/.local/bin/claude-proxy"
+#   claude_proxy_mgmt="127.0.0.1:3181"
+#   claude_proxy_log="/var/log/claude_proxy.log"
+#   claude_proxy_rust_log="claude_proxy=info"
+
+. /etc/rc.subr
+
+name="claude_proxy"
+rcvar="${name}_enable"
+
+load_rc_config "$name"
+
+: ${claude_proxy_enable:="NO"}
+
+# claude_proxy_user is required — the proxy reads OAuth credentials from this
+# user's home directory. Refusing to start with a clear error is friendlier
+# than crashing later with "/.config/claude-proxy/config.toml: no such file".
+if [ -z "${claude_proxy_user}" ]; then
+    err 1 "claude_proxy_user is not set in /etc/rc.conf"
+fi
+
+: ${claude_proxy_home:="/home/${claude_proxy_user}"}
+: ${claude_proxy_command:="${claude_proxy_home}/.local/bin/claude-proxy"}
+: ${claude_proxy_mgmt:="127.0.0.1:3181"}
+: ${claude_proxy_log:="/var/log/${name}.log"}
+: ${claude_proxy_rust_log:="claude_proxy=info"}
+
+pidfile="/var/run/${name}.pid"
+
+# When ${name}_user is set, rc.subr wraps the whole command with `su -m`, so
+# daemon(8) itself runs as ${claude_proxy_user}. We deliberately do NOT pass
+# `daemon -u`: that combination plus `-r` (auto-restart) hits a repeated
+# setusercontext() loop after the first privilege drop and crashes the
+# proxy on every restart.
+#
+# HOME must be set explicitly because env(1) doesn't carry it through —
+# without it the proxy reads /.config/claude-proxy/config.toml.
+command="/usr/sbin/daemon"
+command_args="-r -P ${pidfile} -o ${claude_proxy_log} \
+    /usr/bin/env HOME=${claude_proxy_home} \
+    RUST_LOG=${claude_proxy_rust_log} CLAUDE_PROXY_MGMT=${claude_proxy_mgmt} \
+    ${claude_proxy_command}"
+
+start_precmd="claude_proxy_prestart"
+claude_proxy_prestart() {
+    install -o "${claude_proxy_user}" -g "${claude_proxy_user}" -m 644 \
+        /dev/null "${claude_proxy_log}" 2>/dev/null || \
+        chown "${claude_proxy_user}:${claude_proxy_user}" "${claude_proxy_log}"
+}
+
+run_rc_command "$1"
