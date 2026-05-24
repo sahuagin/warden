@@ -214,7 +214,7 @@ if [ "$RUNTIME" = "mu" ]; then
     # CLI flag was added for this).
     doas /bin/sh -c "
         PROMPT_DECODED=\$(echo '$PROMPT_B64' | base64 -d)
-        timeout $TIMEOUT jexec $POT_NAME env \
+        timeout $TIMEOUT jexec $JEXEC_USER_FLAG -l $POT_NAME env \
             OPENROUTER_API_KEY=$OR_KEY \
             ANTHROPIC_API_KEY=$ANT_KEY \
             /usr/local/pot-bin/mu ask --provider $PROVIDER --model $MODEL $APPEND_SYS_PROMPT_FLAG \"\$PROMPT_DECODED\" 2>&1
@@ -277,7 +277,7 @@ else
     # JSONL output, c137-mem noise filter on the way out.
     doas /bin/sh -c "
         PROMPT_DECODED=\$(echo '$PROMPT_B64' | base64 -d)
-        timeout $TIMEOUT jexec $POT_NAME env \
+        timeout $TIMEOUT jexec $JEXEC_USER_FLAG -l $POT_NAME env \
             OPENROUTER_API_KEY=$OR_KEY \
             ANTHROPIC_API_KEY=$ANT_KEY \
             C137_MEM_HOST=10.1.1.172 \
