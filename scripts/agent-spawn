@@ -99,13 +99,15 @@ TIMEOUT="${AGENT_SPAWN_TIMEOUT:-180}"
 RUNTIME="${AGENT_SPAWN_RUNTIME:-mu}"
 POT_TEMPLATE="${AGENT_SPAWN_POT_TEMPLATE:-agent-runtime}"
 
-# AGENT_SPAWN_USER: jexec -U flag when set, plus HOME redirect from /root to
-# /home/<user>. Default unset = runs as root inside the pot (backwards-compat).
-JEXEC_USER_FLAG=""
-HOME_DIR="/root"
-if [ -n "${AGENT_SPAWN_USER:-}" ]; then
-    JEXEC_USER_FLAG="-U $AGENT_SPAWN_USER"
-    HOME_DIR="/home/$AGENT_SPAWN_USER"
+# AGENT_SPAWN_USER: jexec -U flag + HOME redirect. Defaults to $USER so
+# workers run as the invoking user, not root. Override with
+# AGENT_SPAWN_USER=root to get the old behavior.
+AGENT_SPAWN_USER="${AGENT_SPAWN_USER:-$USER}"
+JEXEC_USER_FLAG="-U $AGENT_SPAWN_USER"
+HOME_DIR="/home/$AGENT_SPAWN_USER"
+if [ "$AGENT_SPAWN_USER" = "root" ]; then
+    JEXEC_USER_FLAG=""
+    HOME_DIR="/root"
 fi
 
 case "$RUNTIME" in
