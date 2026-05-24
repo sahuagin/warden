@@ -1,0 +1,312 @@
+#!/bin/sh
+# agent-spawn — wrapper for spawning ephemeral sub-agents in pot clones.
+#
+# Usage:
+#   agent-spawn <slot-name> <ip> <prompt>
+#
+# Example:
+#   agent-spawn agent-1 10.1.1.201 "List the files in /tmp using bash."
+#
+# Behavior:
+#   1. Clones agent-runtime template -> agent-<slot-name> at <ip>
+#   2. Configures DNS (10.1.1.1)
+#   3. Starts pot
+#   4. Runs the chosen runtime (mu or pi) single-turn with the prompt
+#   5. Captures runtime stdout to a temp file
+#   6. Stops + destroys the pot (idempotent on failure)
+#   7. Prints captured output to stdout
+#
+# Runtime selection (2026-05-17):
+#   - Default runtime is mu (built from sahuagin/mu, mounted via /usr/local/pot-bin/mu
+#     read-only from host ~/pot-bin/mu).
+#   - Legacy pi runtime (installed in template at /usr/local/bin/pi) is retained
+#     as the rollback path. Set AGENT_SPAWN_RUNTIME=pi to use it.
+#   - Anthropic claude-code runtime: AGENT_SPAWN_RUNTIME=claude. Uses
+#     CLAUDE_CODE_OAUTH_TOKEN from ~/.config/claude-code/headless-oauth-token.disabled
+#     against the Max5 plan. claude is the npm-installed Node-based cli.js
+#     (warden's mechanism), baked into agent-runtime template 2026-05-18 via
+#     pkg node24 + fscomp mount of /usr/local/lib/node_modules/@anthropic-ai/
+#     claude-code from host. Symlinked at /usr/local/bin/claude inside the pot.
+#     NO Linuxulator / /compat/linux needed (that was for the Bun build which
+#     deadlocks on inotify). NO ~/.claude or ~/.claude.json bind mount (that
+#     deadlocks on nullfs-propagated POSIX flock with host's live claude).
+#     See memory 9d6dd9a3 for the full recipe.
+#   - Output shape: mu and claude emit plain text; pi emits JSONL (--mode json).
+#     Downstream callers that parsed pi's JSON must set AGENT_SPAWN_RUNTIME=pi
+#     or be updated.
+#
+# Exit codes:
+#   0   success
+#   1   bad arguments
+#   2   pot clone failed
+#   3   pot start failed
+#   4   runtime invocation failed
+#   5   teardown had errors (output may still be valid)
+#
+# Environment variables read:
+#   AGENT_SPAWN_RUNTIME       — mu|pi|claude (default: mu)
+#   AGENT_SPAWN_MODEL         — --model arg (default: deepseek/deepseek-v4-flash)
+#   AGENT_SPAWN_PROVIDER      — --provider arg (default: openrouter)
+#   AGENT_SPAWN_TIMEOUT       — seconds to wait for runtime (default: 180)
+#   AGENT_SPAWN_POT_TEMPLATE  — pot template to clone from (default: agent-runtime).
+#                               Allows per-spawn template selection without etcd
+#                               slot-config changes (e.g., spline-worker-base for
+#                               Rust-toolchain-equipped workers).
+#   AGENT_SPAWN_EXTRA_MOUNTS  — space-separated host:pot[:ro|:rw] triples for
+#                               additional per-spawn mount-ins (default: none).
+#                               Mounts via `pot mount-in` after clone, before start.
+#                               Mount destination dirs MUST pre-exist in the
+#                               template's m/ filesystem (per pot's mount-in rule).
+#                               Default mode is rw if the third field is omitted.
+#   AGENT_SPAWN_CLAUDE_ADD_DIR — path inside the pot to pass as --add-dir to
+#                               claude-code (when RUNTIME=claude). Used to give
+#                               the worker access to a mounted-in worktree.
+#                               Ignored for mu and pi runtimes.
+#   AGENT_SPAWN_USER          — non-root user inside the pot to invoke the
+#                               runtime as (via `jexec -U <user>`). Default is
+#                               unset = runs as root (backwards-compat). REQUIRED
+#                               for claude-code: claude refuses
+#                               --dangerously-skip-permissions when running as
+#                               root/sudo (security safeguard). Also enables
+#                               correct file ownership for mounted directories
+#                               (worker uid should match host owner uid of the
+#                               mount source). The user MUST exist in the pot's
+#                               /etc/passwd. spline-worker-base has a `worker`
+#                               user at uid 1001 (matches host user).
+#
+# Notes:
+#   - Requires doas /bin/sh on the nopass list (already configured for user)
+#   - Reads OpenRouter key from ~/.config/agent/config.toml
+#   - Sub-agent's runtime invocation is single-turn
+#   - Slot name conflicts (already-running pot) are not detected; caller
+#     responsibility to pick unique names
+
+set -e
+
+SLOT="$1"
+IP="$2"
+PROMPT="$3"
+
+if [ -z "$SLOT" ] || [ -z "$IP" ] || [ -z "$PROMPT" ]; then
+    echo "Usage: agent-spawn <slot-name> <ip> <prompt>" >&2
+    exit 1
+fi
+
+POT_NAME="agent-$SLOT"
+MODEL="${AGENT_SPAWN_MODEL:-deepseek/deepseek-v4-flash}"
+PROVIDER="${AGENT_SPAWN_PROVIDER:-openrouter}"
+TIMEOUT="${AGENT_SPAWN_TIMEOUT:-180}"
+RUNTIME="${AGENT_SPAWN_RUNTIME:-mu}"
+POT_TEMPLATE="${AGENT_SPAWN_POT_TEMPLATE:-agent-runtime}"
+
+# AGENT_SPAWN_USER: jexec -U flag when set, plus HOME redirect from /root to
+# /home/<user>. Default unset = runs as root inside the pot (backwards-compat).
+JEXEC_USER_FLAG=""
+HOME_DIR="/root"
+if [ -n "${AGENT_SPAWN_USER:-}" ]; then
+    JEXEC_USER_FLAG="-U $AGENT_SPAWN_USER"
+    HOME_DIR="/home/$AGENT_SPAWN_USER"
+fi
+
+case "$RUNTIME" in
+    mu|pi|claude) ;;
+    *) echo "agent-spawn: AGENT_SPAWN_RUNTIME must be 'mu', 'pi', or 'claude' (got: $RUNTIME)" >&2; exit 1 ;;
+esac
+
+# Extract API keys from agent config.toml
+OR_KEY=$(awk '/^\[openrouter\]/{f=1} f && /^api_key/{gsub(/[" ]/,""); split($0, a, "="); print a[2]; exit}' ~/.config/agent/config.toml | sed 's/#.*//')
+ANT_KEY=$(awk '/^\[anthropic\]/{f=1} f && /^api_key/{gsub(/[" ]/,""); split($0, a, "="); print a[2]; exit}' ~/.config/agent/config.toml)
+
+if [ -z "$OR_KEY" ] && [ -z "$ANT_KEY" ]; then
+    echo "agent-spawn: could not read any api_key from ~/.config/agent/config.toml" >&2
+    exit 1
+fi
+
+OUTPUT_FILE=$(mktemp /tmp/agent-spawn.XXXXXX)
+TEARDOWN_LOG=$(mktemp /tmp/agent-spawn-teardown.XXXXXX)
+
+teardown() {
+    {
+        doas /bin/sh -c "pot stop $POT_NAME 2>&1 || true"
+        doas /bin/sh -c "pot destroy -p $POT_NAME 2>&1 || true"
+    } > "$TEARDOWN_LOG" 2>&1
+}
+
+# Ensure teardown happens on any exit
+trap 'teardown' EXIT INT TERM
+
+echo "[$(date +%H:%M:%S)] agent-spawn: cloning $POT_TEMPLATE -> $POT_NAME @ $IP" >&2
+
+if ! doas /bin/sh -c "pot clone -p $POT_NAME -P $POT_TEMPLATE -i $IP -d off 2>&1"; then
+    echo "agent-spawn: clone failed" >&2
+    exit 2
+fi
+
+# Pre-stage DNS into clone before starting (resolv.conf gets written to /etc/resolv.conf)
+doas /bin/sh -c "echo 'nameserver 10.1.1.1' > /opt/pot/jails/$POT_NAME/m/etc/resolv.conf"
+
+# Optional per-spawn extra mount-ins (e.g., per-slot worktrees for spline-worker
+# clones). Format: AGENT_SPAWN_EXTRA_MOUNTS="host1:pot1[:ro|:rw] host2:pot2[:ro|:rw]"
+# (ro/rw suffix is optional; default rw). Mount destination dirs MUST pre-exist
+# in the template's m/ filesystem (per pot's mount-in requirement).
+if [ -n "${AGENT_SPAWN_EXTRA_MOUNTS:-}" ]; then
+    for triple in $AGENT_SPAWN_EXTRA_MOUNTS; do
+        host_path=$(echo "$triple" | awk -F: '{print $1}')
+        pot_path=$(echo "$triple"  | awk -F: '{print $2}')
+        mode=$(echo "$triple"      | awk -F: '{print $3}')
+        if [ -z "$host_path" ] || [ -z "$pot_path" ]; then
+            echo "agent-spawn: bad AGENT_SPAWN_EXTRA_MOUNTS entry '$triple' (expected host:pot[:ro|:rw])" >&2
+            exit 1
+        fi
+        extra_flag=""
+        if [ "$mode" = "ro" ]; then
+            extra_flag="-r"
+        fi
+        echo "[$(date +%H:%M:%S)] agent-spawn: mount-in $host_path -> $pot_path ${mode:-rw}" >&2
+        if ! doas /bin/sh -c "pot mount-in -p $POT_NAME -d $host_path -m $pot_path $extra_flag 2>&1"; then
+            echo "agent-spawn: mount-in '$triple' failed" >&2
+            exit 2
+        fi
+    done
+fi
+
+echo "[$(date +%H:%M:%S)] agent-spawn: starting $POT_NAME" >&2
+
+# Redirect pot's banner ("Starting syslogd...", "Updating motd:.", etc.)
+# to stderr so it doesn't pollute the agent's stdout output.
+if ! doas /bin/sh -c "pot start $POT_NAME 2>&1" >&2; then
+    echo "agent-spawn: start failed" >&2
+    exit 3
+fi
+
+# Pre-stage DNS (pot rewrites it on start; do it again post-start)
+doas /bin/sh -c "echo 'nameserver 10.1.1.1' > /opt/pot/jails/$POT_NAME/m/etc/resolv.conf"
+
+# Phase 1.3 (flywheel-p2w): if a context manifest was prepared by agent-spawn-v2,
+# stage it inside the pot at /var/run/agent/context_cache.txt and ask pi to
+# load it as a system-prompt extension via --append-system-prompt.
+APPEND_SYS_PROMPT_FLAG=""
+if [ -n "${AGENT_SPAWN_CONTEXT_FILE:-}" ] && [ -r "$AGENT_SPAWN_CONTEXT_FILE" ]; then
+    doas /bin/sh -c "mkdir -p /opt/pot/jails/$POT_NAME/m/var/run/agent && \
+        cp '$AGENT_SPAWN_CONTEXT_FILE' /opt/pot/jails/$POT_NAME/m/var/run/agent/context_cache.txt && \
+        chmod 0644 /opt/pot/jails/$POT_NAME/m/var/run/agent/context_cache.txt"
+    APPEND_SYS_PROMPT_FLAG="--append-system-prompt /var/run/agent/context_cache.txt"
+    echo "[$(date +%H:%M:%S)] agent-spawn: staged context manifest into pot ($(wc -c < "$AGENT_SPAWN_CONTEXT_FILE") bytes)" >&2
+fi
+
+echo "[$(date +%H:%M:%S)] agent-spawn: invoking $RUNTIME (model=$MODEL provider=$PROVIDER timeout=${TIMEOUT}s)" >&2
+
+# Escape single quotes in prompt for embedding in doas /bin/sh -c '...'
+# We use base64 to pass the prompt safely without quoting headaches
+PROMPT_B64=$(printf '%s' "$PROMPT" | base64 | tr -d '\n')
+
+# Disable set -e for the runtime invocation — non-zero exit (e.g. timeout=124)
+# is expected information we want to surface, not a fatal error.
+set +e
+if [ "$RUNTIME" = "mu" ]; then
+    # mu lives in the host-side ~/pot-bin/ and is mounted read-only at
+    # /usr/local/pot-bin/mu via pot's fscomp.conf. Updates: cp the new
+    # binary to ~/pot-bin/mu; next spawn picks it up. No template
+    # snapshot dance.
+    #
+    # mu emits plain text by default (no --mode json equivalent needed).
+    # The --append-system-prompt path matches pi's exactly (mu-x83o
+    # CLI flag was added for this).
+    doas /bin/sh -c "
+        PROMPT_DECODED=\$(echo '$PROMPT_B64' | base64 -d)
+        timeout $TIMEOUT jexec $POT_NAME env \
+            OPENROUTER_API_KEY=$OR_KEY \
+            ANTHROPIC_API_KEY=$ANT_KEY \
+            /usr/local/pot-bin/mu ask --provider $PROVIDER --model $MODEL $APPEND_SYS_PROMPT_FLAG \"\$PROMPT_DECODED\" 2>&1
+    " > "$OUTPUT_FILE" 2>&1
+elif [ "$RUNTIME" = "claude" ]; then
+    # claude-code (Anthropic CLI, npm-installed Node version) — uses
+    # CLAUDE_CODE_OAUTH_TOKEN against the Max5 plan via headless auth.
+    #
+    # Unsets BOTH ANTHROPIC_API_KEY AND ANTHROPIC_BASE_URL to defend against
+    # the silent-billing trap (memory ac0cc306): if either is set, claude-code
+    # silently prefers them over OAuth, billing to the API tier even though
+    # OAuth was configured. The unset MUST cover both vars.
+    #
+    # claude is the npm-installed Node version at /usr/local/bin/claude (a
+    # symlink to ../lib/node_modules/@anthropic-ai/claude-code/cli.js, which
+    # is mounted ro from host via fscomp.conf). Node24 lives in the pot from
+    # `pkg install node24` baked into agent-runtime template 2026-05-18.
+    # Snapshot: working-2026-05-18z-claude-bake.
+    #
+    # HOME=/root is per-pot ephemeral storage — claude creates a fresh
+    # /root/.claude/.claude.json in the jail. We intentionally DO NOT mount
+    # host's ~/.claude{,/json} because nullfs propagates POSIX flock; the
+    # host's live claude session holds the lock and the pot's claude blocks
+    # forever waiting for it (see memory 9d6dd9a3).
+    #
+    # stdin redirected from /dev/null to ensure no accidental TTY-detection
+    # path keeps claude waiting on input it'll never get.
+    if [ ! -r "$HOME/.config/claude-code/headless-oauth-token.disabled" ]; then
+        echo "agent-spawn: missing $HOME/.config/claude-code/headless-oauth-token.disabled (run \`claude setup-token\` interactively; rename to .disabled to prevent host-side auto-pickup)" >&2
+        exit 4
+    fi
+    TOKEN_B64=$(base64 < "$HOME/.config/claude-code/headless-oauth-token.disabled" | tr -d '\n')
+    # --dangerously-skip-permissions is load-bearing for headless dispatch:
+    # claude defaults to asking permission for tool calls (Read, Bash, Edit, etc.)
+    # but stdin is /dev/null — no human to answer. Without this flag, any worker
+    # that needs to use tools will hang or timeout. See memory ec81d442 finding #1
+    # (the dispatch shape was validated through 6+ iterations of the mu protocol-
+    # iteration cycle 2026-05-19).
+    #
+    # Optional --add-dir arg for giving claude access to a mount-in path
+    # (e.g., spline-worker's /work/spline-connect worktree). Uses the -- arg
+    # terminator after --add-dir to ensure the prompt isn't swallowed by
+    # --add-dir's variadic parsing (per memory ec81d442 finding #2).
+    CLAUDE_ADD_DIR_ARGS=""
+    if [ -n "${AGENT_SPAWN_CLAUDE_ADD_DIR:-}" ]; then
+        CLAUDE_ADD_DIR_ARGS="--add-dir $AGENT_SPAWN_CLAUDE_ADD_DIR --"
+    fi
+    doas /bin/sh -c "
+        PROMPT_DECODED=\$(echo '$PROMPT_B64' | base64 -d)
+        TOKEN_DECODED=\$(echo '$TOKEN_B64' | base64 -d)
+        timeout $TIMEOUT jexec $JEXEC_USER_FLAG -l $POT_NAME env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL \
+            HOME=$HOME_DIR \
+            LANG=C.UTF-8 \
+            CLAUDE_CODE_OAUTH_TOKEN=\"\$TOKEN_DECODED\" \
+            IS_SANDBOX=1 \
+            /usr/local/bin/claude -p --dangerously-skip-permissions $CLAUDE_ADD_DIR_ARGS \"\$PROMPT_DECODED\" </dev/null 2>&1
+    " > "$OUTPUT_FILE" 2>&1
+else
+    # pi runtime — legacy rollback path. Same env shape as before;
+    # JSONL output, c137-mem noise filter on the way out.
+    doas /bin/sh -c "
+        PROMPT_DECODED=\$(echo '$PROMPT_B64' | base64 -d)
+        timeout $TIMEOUT jexec $POT_NAME env \
+            OPENROUTER_API_KEY=$OR_KEY \
+            ANTHROPIC_API_KEY=$ANT_KEY \
+            C137_MEM_HOST=10.1.1.172 \
+            PI_HTTP_ALLOW_PRIVATE=1 \
+            PI_HTTP_ALLOW_LOOPBACK=1 \
+            /usr/local/bin/pi --provider $PROVIDER --model $MODEL --mode json $APPEND_SYS_PROMPT_FLAG -p \"\$PROMPT_DECODED\" 2>&1
+    " > "$OUTPUT_FILE" 2>&1
+fi
+
+RUNTIME_EXIT=$?
+set -e
+
+echo "[$(date +%H:%M:%S)] agent-spawn: $RUNTIME exit=$RUNTIME_EXIT, output bytes=$(wc -c < "$OUTPUT_FILE")" >&2
+
+if [ "$RUNTIME_EXIT" -ne 0 ]; then
+    echo "agent-spawn: $RUNTIME invocation failed (exit $RUNTIME_EXIT)" >&2
+    cat "$OUTPUT_FILE" >&2
+    rm -f "$OUTPUT_FILE"
+    exit 4
+fi
+
+if [ "$RUNTIME" = "pi" ]; then
+    # Strip the c137-mem TLS-error noise from pi's output (known issue, separate concern).
+    grep -v 'c137-mem.*TLS required' "$OUTPUT_FILE" | grep -v 'agent-runtime' || cat "$OUTPUT_FILE"
+else
+    # mu and claude both emit clean text; pass through verbatim.
+    cat "$OUTPUT_FILE"
+fi
+rm -f "$OUTPUT_FILE"
+
+# Teardown happens via trap
+exit 0

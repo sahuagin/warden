@@ -1,0 +1,289 @@
+#!/bin/sh
+# agent-spawn-v3 — self-contained pot-based sub-agent spawn.
+#
+# Combines agent-spawn-v2 (etcd slot allocation + context manifest) with
+# agent-spawn (pot lifecycle). Runs as $USER inside the pot (not root).
+# Uses --permission-mode bypassPermissions for claude.
+#
+# Usage:
+#   agent-spawn-v3 [opts] <prompt>
+#
+# Options:
+#   -t <task_id>             record task_id in lease for tracking
+#   -h                       help
+#   --runtime <mu|pi|claude> runtime selection (default: mu)
+#   --model <model>          model override
+#   --provider <provider>    provider override (mu/pi only)
+#   --timeout <seconds>      runtime timeout (default: 180)
+#   --pot-template <name>    pot template to clone (default: agent-runtime)
+#   --extra-mounts <spec>    space-separated host:pot[:ro|:rw] triples
+#   --add-dir <path>         --add-dir for claude-code (path inside pot)
+#   --context-query <query>  seed memory context
+#   --context-cwd <path>     cwd for memory context (default: $PWD)
+#   --context-limit <N>      max memory entries (default 10)
+#   --context-manifest <fn>  use file as manifest directly
+#   --no-context             skip context manifest
+#
+# Exit codes:
+#   0     success
+#   1     bad args
+#   2     no slots available / clone failed
+#   3     pot start failed
+#   4     runtime invocation failed
+#   5     teardown had errors
+
+set -e
+
+TASK_ID="auto"
+RUNTIME="mu"
+MODEL=""
+PROVIDER=""
+TIMEOUT="180"
+POT_TEMPLATE="agent-runtime"
+EXTRA_MOUNTS=""
+CLAUDE_ADD_DIR=""
+CONTEXT_QUERY=""
+CONTEXT_CWD="$PWD"
+CONTEXT_LIMIT="10"
+CONTEXT_MANIFEST=""
+NO_CONTEXT=""
+WORKER_HOST="${C137_MEM_HOST:-10.1.1.172}"
+WORKER_PORT="${C137_MEM_PORT:-37778}"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -t)                 TASK_ID="$2";          shift 2 ;;
+        -h|--help)
+            sed -n '/^# agent-spawn-v3/,/^$/p' "$0" | sed 's/^# \?//'
+            exit 0 ;;
+        --runtime)          RUNTIME="$2";          shift 2 ;;
+        --model)            MODEL="$2";            shift 2 ;;
+        --provider)         PROVIDER="$2";         shift 2 ;;
+        --timeout)          TIMEOUT="$2";          shift 2 ;;
+        --pot-template)     POT_TEMPLATE="$2";     shift 2 ;;
+        --extra-mounts)     EXTRA_MOUNTS="$2";     shift 2 ;;
+        --add-dir)          CLAUDE_ADD_DIR="$2";   shift 2 ;;
+        --context-query)    CONTEXT_QUERY="$2";    shift 2 ;;
+        --context-cwd)      CONTEXT_CWD="$2";      shift 2 ;;
+        --context-limit)    CONTEXT_LIMIT="$2";    shift 2 ;;
+        --context-manifest) CONTEXT_MANIFEST="$2"; shift 2 ;;
+        --no-context)       NO_CONTEXT="1";        shift ;;
+        --) shift; break ;;
+        -*) echo "agent-spawn-v3: unknown option $1" >&2; exit 1 ;;
+        *)  break ;;
+    esac
+done
+
+PROMPT="$1"
+if [ -z "$PROMPT" ]; then
+    echo "Usage: agent-spawn-v3 [opts] <prompt>" >&2
+    exit 1
+fi
+
+case "$RUNTIME" in
+    mu|pi|claude) ;;
+    *) echo "agent-spawn-v3: --runtime must be mu, pi, or claude (got: $RUNTIME)" >&2; exit 1 ;;
+esac
+
+# Defaults per runtime
+if [ -z "$MODEL" ]; then
+    case "$RUNTIME" in
+        mu|pi)   MODEL="deepseek/deepseek-v4-flash" ;;
+        claude)  MODEL="claude-haiku-4-5-20251001" ;;
+    esac
+fi
+if [ -z "$PROVIDER" ]; then
+    PROVIDER="openrouter"
+fi
+
+# ── Slot acquisition ────────────────────────────────────────────────────────
+
+acquire_output=$(agent-slot acquire "$TASK_ID" 2>&1) || {
+    rc=$?
+    echo "agent-spawn-v3: slot acquisition failed:" >&2
+    echo "$acquire_output" >&2
+    [ "$rc" -eq 1 ] && exit 2
+    exit "$rc"
+}
+eval "$acquire_output"
+
+if [ -z "$AGENT_SLOT_NAME" ] || [ -z "$AGENT_SLOT_IP" ]; then
+    echo "agent-spawn-v3: agent-slot acquire output malformed:" >&2
+    echo "$acquire_output" >&2
+    exit 2
+fi
+
+POT_NAME="$AGENT_SLOT_NAME"
+IP="$AGENT_SLOT_IP"
+
+echo "[$(date +%H:%M:%S)] agent-spawn-v3: acquired slot $POT_NAME @ $IP (lease=$AGENT_SLOT_LEASE, ttl=${AGENT_SLOT_TTL}s)" >&2
+
+# ── Context manifest ───────────────────────────────────────────────────────
+
+MANIFEST_TMP=""
+
+if [ -z "$NO_CONTEXT" ]; then
+    MANIFEST_TMP=$(mktemp /tmp/agent-spawn-manifest.XXXXXX)
+
+    if [ -n "$CONTEXT_MANIFEST" ]; then
+        if [ ! -r "$CONTEXT_MANIFEST" ]; then
+            echo "agent-spawn-v3: --context-manifest not readable: $CONTEXT_MANIFEST" >&2
+            exit 1
+        fi
+        cp "$CONTEXT_MANIFEST" "$MANIFEST_TMP"
+        SOURCE_DESC="manifest=$CONTEXT_MANIFEST"
+    else
+        encoded_query=$(printf '%s' "$CONTEXT_QUERY" | sed 's/ /%20/g')
+        encoded_cwd=$(printf '%s' "$CONTEXT_CWD" | sed 's/ /%20/g; s|/|%2F|g')
+        url="http://${WORKER_HOST}:${WORKER_PORT}/api/context/inject?cwd=${encoded_cwd}&signals=${encoded_query}&limit=${CONTEXT_LIMIT}&include_observations=false"
+        if ! curl -sS --max-time 10 "$url" > "$MANIFEST_TMP" 2>&1; then
+            echo "agent-spawn-v3: failed to fetch context from worker ($url)" >&2
+            cat "$MANIFEST_TMP" >&2
+            : > "$MANIFEST_TMP"
+        fi
+        SOURCE_DESC="worker=${WORKER_HOST}:${WORKER_PORT} cwd=${CONTEXT_CWD} signals='${CONTEXT_QUERY}' limit=${CONTEXT_LIMIT}"
+    fi
+
+    role_lines=$(grep -ciE '^role:' "$MANIFEST_TMP" 2>/dev/null || echo 0)
+    if [ "$role_lines" -gt 0 ]; then
+        echo "agent-spawn-v3: stripped $role_lines role: directive(s) from manifest" >&2
+        grep -viE '^role:' "$MANIFEST_TMP" > "${MANIFEST_TMP}.scrubbed"
+        mv "${MANIFEST_TMP}.scrubbed" "$MANIFEST_TMP"
+    fi
+
+    {
+        printf '<!-- context manifest: provenance -->\n'
+        printf '<!-- spawned_at: %s -->\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf '<!-- spawner: %s@%s -->\n' "$(id -un)" "$(hostname -s)"
+        printf '<!-- slot: %s lease: %s -->\n' "$POT_NAME" "${AGENT_SLOT_LEASE:-none}"
+        printf '<!-- source: %s -->\n' "$SOURCE_DESC"
+        printf '<!-- end provenance -->\n\n'
+        cat "$MANIFEST_TMP"
+    } > "${MANIFEST_TMP}.hdr"
+    mv "${MANIFEST_TMP}.hdr" "$MANIFEST_TMP"
+
+    echo "[$(date +%H:%M:%S)] agent-spawn-v3: context manifest ready ($(wc -c < "$MANIFEST_TMP") bytes)" >&2
+fi
+
+# ── Pot lifecycle (inlined from agent-spawn) ──────────────────────────────
+
+OUTPUT_FILE=$(mktemp /tmp/agent-spawn-v3.XXXXXX)
+
+cleanup() {
+    rc=$?
+    if [ -n "$MANIFEST_TMP" ] && [ -f "$MANIFEST_TMP" ] && [ -n "${AGENT_SPAWN_MANIFEST_LOG_DIR:-}" ]; then
+        if mkdir -p "$AGENT_SPAWN_MANIFEST_LOG_DIR" 2>/dev/null; then
+            log_name="${TASK_ID}-${POT_NAME:-noslot}-${AGENT_SLOT_LEASE:-nolease}.txt"
+            cp "$MANIFEST_TMP" "$AGENT_SPAWN_MANIFEST_LOG_DIR/$log_name" 2>/dev/null || true
+        fi
+    fi
+    [ -n "$MANIFEST_TMP" ] && [ -f "$MANIFEST_TMP" ] && rm -f "$MANIFEST_TMP"
+    doas /bin/sh -c "pot stop $POT_NAME 2>&1 || true" >/dev/null 2>&1
+    doas /bin/sh -c "pot destroy -p $POT_NAME 2>&1 || true" >/dev/null 2>&1
+    rm -f "$OUTPUT_FILE"
+    agent-slot release "$POT_NAME" >/dev/null 2>&1 || true
+    exit "$rc"
+}
+trap cleanup EXIT INT TERM
+
+agent_spawn() {
+    # Clone
+    echo "[$(date +%H:%M:%S)] agent-spawn-v3: cloning $POT_TEMPLATE -> $POT_NAME @ $IP" >&2
+    if ! doas /bin/sh -c "pot clone -F -p $POT_NAME -P $POT_TEMPLATE -i $IP -d off 2>&1"; then
+        echo "agent-spawn-v3: clone failed" >&2
+        exit 2
+    fi
+
+    # DNS
+    doas /bin/sh -c "echo 'nameserver 10.1.1.1' > /opt/pot/jails/$POT_NAME/m/etc/resolv.conf"
+
+    # Start
+    echo "[$(date +%H:%M:%S)] agent-spawn-v3: starting $POT_NAME" >&2
+    if ! doas /bin/sh -c "pot start $POT_NAME 2>&1" >&2; then
+        echo "agent-spawn-v3: start failed" >&2
+        exit 3
+    fi
+
+    # DNS again (pot rewrites resolv.conf on start)
+    doas /bin/sh -c "echo 'nameserver 10.1.1.1' > /opt/pot/jails/$POT_NAME/m/etc/resolv.conf"
+
+    # Stage context manifest into pot
+    APPEND_SYS_PROMPT_FLAG=""
+    if [ -n "$MANIFEST_TMP" ] && [ -r "$MANIFEST_TMP" ]; then
+        doas /bin/sh -c "mkdir -p /opt/pot/jails/$POT_NAME/m/var/run/agent && \
+            cp '$MANIFEST_TMP' /opt/pot/jails/$POT_NAME/m/var/run/agent/context_cache.txt && \
+            chmod 0644 /opt/pot/jails/$POT_NAME/m/var/run/agent/context_cache.txt"
+        APPEND_SYS_PROMPT_FLAG="--append-system-prompt /var/run/agent/context_cache.txt"
+    fi
+
+    # ── Runtime invocation ─────────────────────────────────────────────────
+    echo "[$(date +%H:%M:%S)] agent-spawn-v3: invoking $RUNTIME (model=$MODEL timeout=${TIMEOUT}s)" >&2
+
+    PROMPT_B64=$(printf '%s' "$PROMPT" | base64 | tr -d '\n')
+
+    OR_KEY=$(awk '/^\[openrouter\]/{f=1} f && /^api_key/{gsub(/[" ]/,""); split($0, a, "="); print a[2]; exit}' ~/.config/agent/config.toml 2>/dev/null | sed 's/#.*//')
+    ANT_KEY=$(awk '/^\[anthropic\]/{f=1} f && /^api_key/{gsub(/[" ]/,""); split($0, a, "="); print a[2]; exit}' ~/.config/agent/config.toml 2>/dev/null)
+
+    set +e
+    if [ "$RUNTIME" = "mu" ]; then
+        doas /bin/sh -c "
+            PROMPT_DECODED=\$(echo '$PROMPT_B64' | base64 -d)
+            timeout $TIMEOUT jexec -U ${USER} -l $POT_NAME env \
+                OPENROUTER_API_KEY=$OR_KEY \
+                ANTHROPIC_API_KEY=$ANT_KEY \
+                /usr/local/pot-bin/mu ask --provider $PROVIDER --model $MODEL $APPEND_SYS_PROMPT_FLAG \"\$PROMPT_DECODED\" 2>&1
+        " > "$OUTPUT_FILE" 2>&1
+
+    elif [ "$RUNTIME" = "claude" ]; then
+        if [ ! -r "$HOME/.config/claude-code/headless-oauth-token.disabled" ]; then
+            echo "agent-spawn-v3: missing headless-oauth-token.disabled" >&2
+            exit 4
+        fi
+        TOKEN_B64=$(base64 < "$HOME/.config/claude-code/headless-oauth-token.disabled" | tr -d '\n')
+        CLAUDE_ADD_DIR_ARGS=""
+        if [ -n "$CLAUDE_ADD_DIR" ]; then
+            CLAUDE_ADD_DIR_ARGS="--add-dir $CLAUDE_ADD_DIR --"
+        fi
+        doas /bin/sh -c "
+            PROMPT_DECODED=\$(echo '$PROMPT_B64' | base64 -d)
+            TOKEN_DECODED=\$(echo '$TOKEN_B64' | base64 -d)
+            timeout $TIMEOUT jexec -U ${USER} -l $POT_NAME env -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL \
+                HOME=/tmp/claude-worker \
+                LANG=C.UTF-8 \
+                CLAUDE_CODE_OAUTH_TOKEN=\"\$TOKEN_DECODED\" \
+                /usr/local/bin/claude -p --permission-mode bypassPermissions $CLAUDE_ADD_DIR_ARGS \"\$PROMPT_DECODED\" </dev/null 2>&1
+        " > "$OUTPUT_FILE" 2>&1
+
+    elif [ "$RUNTIME" = "pi" ]; then
+        doas /bin/sh -c "
+            PROMPT_DECODED=\$(echo '$PROMPT_B64' | base64 -d)
+            timeout $TIMEOUT jexec -U ${USER} -l $POT_NAME env \
+                OPENROUTER_API_KEY=$OR_KEY \
+                ANTHROPIC_API_KEY=$ANT_KEY \
+                C137_MEM_HOST=10.1.1.172 \
+                PI_HTTP_ALLOW_PRIVATE=1 \
+                PI_HTTP_ALLOW_LOOPBACK=1 \
+                /usr/local/bin/pi --provider $PROVIDER --model $MODEL --mode json $APPEND_SYS_PROMPT_FLAG -p \"\$PROMPT_DECODED\" 2>&1
+        " > "$OUTPUT_FILE" 2>&1
+    fi
+
+    RUNTIME_EXIT=$?
+    set -e
+
+    echo "[$(date +%H:%M:%S)] agent-spawn-v3: $RUNTIME exit=$RUNTIME_EXIT, output bytes=$(wc -c < "$OUTPUT_FILE")" >&2
+
+    if [ "$RUNTIME_EXIT" -ne 0 ]; then
+        echo "agent-spawn-v3: $RUNTIME invocation failed (exit $RUNTIME_EXIT)" >&2
+        cat "$OUTPUT_FILE" >&2
+        exit 4
+    fi
+
+    if [ "$RUNTIME" = "pi" ]; then
+        grep -v 'c137-mem.*TLS required' "$OUTPUT_FILE" | grep -v 'agent-runtime' || cat "$OUTPUT_FILE"
+    else
+        cat "$OUTPUT_FILE"
+    fi
+}
+
+agent_spawn
+exit 0

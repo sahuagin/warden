@@ -1,0 +1,175 @@
+#!/bin/sh
+# agent-spawn-v2 — pot-based sub-agent spawn with auto slot allocation.
+#
+# Wraps the existing agent-spawn (which takes <slot-name> <ip> <prompt>) by
+# acquiring an etcd-leased slot first, running, then releasing on exit.
+#
+# Phase 1.3 adds a context-seeded spawn manifest: relevant memory context is
+# fetched from c137-memory-worker, scrubbed of any role: directives (no fixed
+# roles per memory 2e92a6eb pot architecture), and mounted into the pot so pi
+# loads it as a system-prompt extension at startup.
+#
+# Usage:
+#   agent-spawn-v2 [opts] <prompt>
+#
+# Options:
+#   -t <task_id>             record task_id in lease for tracking
+#   -h                       help
+#   --context-query <query>  signals/keywords to seed memory context (passed to
+#                            /api/context/inject signals param)
+#   --context-cwd <path>     cwd to query memory context for (default: spawning shell's PWD)
+#   --context-limit <N>      max memory entries (default 10)
+#   --context-manifest <fn>  use the given file as the manifest (overrides query path)
+#   --no-context             opt out — no context manifest mounted
+#
+# Exit codes (mirror agent-spawn):
+#   0     success
+#   1     bad args
+#   2     no slots available (all leased)
+#   3-99  forwarded from agent-spawn
+#
+# Environment passthrough (forwarded to agent-spawn):
+#   AGENT_SPAWN_MODEL / PROVIDER / TIMEOUT
+#   AGENT_SLOT_TTL    — etcd lease TTL (default 600s, override for long jobs)
+#   AGENT_SPAWN_CONTEXT_FILE — set by this script, points at the manifest file
+
+set -e
+
+TASK_ID="auto"
+CONTEXT_QUERY=""
+CONTEXT_CWD="$PWD"
+CONTEXT_LIMIT="10"
+CONTEXT_MANIFEST=""
+NO_CONTEXT=""
+WORKER_HOST="${C137_MEM_HOST:-10.1.1.172}"
+WORKER_PORT="${C137_MEM_PORT:-37778}"
+
+# Manual long-flag parsing (sh doesn't have getopt-long portably).
+# Stop at the first non-flag positional so its content (the prompt — which may
+# contain spaces) is preserved as a single argument.
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -t)                 TASK_ID="$2";          shift 2 ;;
+        -h|--help)
+            sed -n '/^# agent-spawn-v2/,/^$/p' "$0" | sed 's/^# \?//'
+            exit 0 ;;
+        --context-query)    CONTEXT_QUERY="$2";    shift 2 ;;
+        --context-cwd)      CONTEXT_CWD="$2";      shift 2 ;;
+        --context-limit)    CONTEXT_LIMIT="$2";    shift 2 ;;
+        --context-manifest) CONTEXT_MANIFEST="$2"; shift 2 ;;
+        --no-context)       NO_CONTEXT="1";        shift ;;
+        --) shift; break ;;
+        -*) echo "agent-spawn-v2: unknown option $1" >&2; exit 1 ;;
+        *)  break ;;
+    esac
+done
+
+PROMPT="$1"
+if [ -z "$PROMPT" ]; then
+    echo "Usage: agent-spawn-v2 [opts] <prompt>" >&2
+    echo "  --context-query/cwd/limit, --context-manifest, --no-context" >&2
+    exit 1
+fi
+
+# Acquire a slot. acquire prints eval-able env-var assignments.
+acquire_output=$(agent-slot acquire "$TASK_ID" 2>&1) || {
+    rc=$?
+    echo "agent-spawn-v2: slot acquisition failed:" >&2
+    echo "$acquire_output" >&2
+    [ "$rc" -eq 1 ] && exit 2
+    exit "$rc"
+}
+eval "$acquire_output"
+
+if [ -z "$AGENT_SLOT_NAME" ] || [ -z "$AGENT_SLOT_IP" ]; then
+    echo "agent-spawn-v2: agent-slot acquire output malformed:" >&2
+    echo "$acquire_output" >&2
+    exit 2
+fi
+
+echo "[$(date +%H:%M:%S)] agent-spawn-v2: acquired slot $AGENT_SLOT_NAME @ $AGENT_SLOT_IP (lease=$AGENT_SLOT_LEASE, ttl=${AGENT_SLOT_TTL}s)" >&2
+
+# Track the manifest temp file so we can clean it up on exit
+MANIFEST_TMP=""
+
+release_slot() {
+    rc=$?
+    [ -n "$MANIFEST_TMP" ] && [ -f "$MANIFEST_TMP" ] && rm -f "$MANIFEST_TMP"
+    agent-slot release "$AGENT_SLOT_NAME" >&2 2>&1 || true
+    exit "$rc"
+}
+trap release_slot EXIT INT TERM
+
+# ── Phase 1.3: build the context manifest ──────────────────────────────────
+# Three modes:
+#  (1) --no-context: skip entirely
+#  (2) --context-manifest <file>: use that file directly (still goes through
+#      no-fixed-roles scrub)
+#  (3) default: fetch from c137-memory-worker /api/context/inject
+
+if [ -z "$NO_CONTEXT" ]; then
+    MANIFEST_TMP=$(mktemp /tmp/agent-spawn-manifest.XXXXXX)
+
+    if [ -n "$CONTEXT_MANIFEST" ]; then
+        if [ ! -r "$CONTEXT_MANIFEST" ]; then
+            echo "agent-spawn-v2: --context-manifest file not readable: $CONTEXT_MANIFEST" >&2
+            exit 1
+        fi
+        cp "$CONTEXT_MANIFEST" "$MANIFEST_TMP"
+        SOURCE_DESC="manifest=$CONTEXT_MANIFEST"
+    else
+        # Fetch from worker
+        # signals are space-separated keywords; URL-encode the query terms
+        encoded_query=$(printf '%s' "$CONTEXT_QUERY" | sed 's/ /%20/g')
+        encoded_cwd=$(printf '%s' "$CONTEXT_CWD" | sed 's/ /%20/g; s|/|%2F|g')
+        url="http://${WORKER_HOST}:${WORKER_PORT}/api/context/inject?cwd=${encoded_cwd}&signals=${encoded_query}&limit=${CONTEXT_LIMIT}&include_observations=false"
+        if ! curl -sS --max-time 10 "$url" > "$MANIFEST_TMP" 2>&1; then
+            echo "agent-spawn-v2: failed to fetch context from worker ($url)" >&2
+            cat "$MANIFEST_TMP" >&2
+            # Don't fail the spawn; just skip context.
+            : > "$MANIFEST_TMP"
+        fi
+        SOURCE_DESC="worker=${WORKER_HOST}:${WORKER_PORT} cwd=${CONTEXT_CWD} signals='${CONTEXT_QUERY}' limit=${CONTEXT_LIMIT}"
+    fi
+
+    # No-fixed-roles enforcement: strip any line beginning with "role:" or
+    # "Role:" and warn via stderr (and task_log if available). Per memory
+    # 2e92a6eb (pot architecture: ephemeral, context in memory, no fixed
+    # roles).
+    role_lines=$(grep -ciE '^role:' "$MANIFEST_TMP" 2>/dev/null || echo 0)
+    if [ "$role_lines" -gt 0 ]; then
+        echo "agent-spawn-v2: warning — manifest contained $role_lines role: directive(s); stripped" >&2
+        if command -v task_log >/dev/null 2>&1; then
+            task_log add --desc "agent-spawn-v2 stripped role: directives" \
+                --result "slot=$AGENT_SLOT_NAME stripped=$role_lines source=$SOURCE_DESC" \
+                --tags "agent-spawn-v2,no-fixed-roles,phase1-3" --status completed >/dev/null 2>&1 || true
+        fi
+        grep -viE '^role:' "$MANIFEST_TMP" > "${MANIFEST_TMP}.scrubbed"
+        mv "${MANIFEST_TMP}.scrubbed" "$MANIFEST_TMP"
+    fi
+
+    # Prepend provenance header
+    {
+        printf '<!-- context manifest: provenance -->\n'
+        printf '<!-- spawned_at: %s -->\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf '<!-- spawner: %s@%s -->\n' "$(id -un)" "$(hostname -s)"
+        printf '<!-- slot: %s lease: %s -->\n' "$AGENT_SLOT_NAME" "${AGENT_SLOT_LEASE:-none}"
+        printf '<!-- source: %s -->\n' "$SOURCE_DESC"
+        printf '<!-- ttl_seconds: %s -->\n' "${AGENT_SLOT_TTL:-600}"
+        printf '<!-- end provenance -->\n\n'
+        cat "$MANIFEST_TMP"
+    } > "${MANIFEST_TMP}.hdr"
+    mv "${MANIFEST_TMP}.hdr" "$MANIFEST_TMP"
+
+    bytes=$(wc -c < "$MANIFEST_TMP")
+    echo "[$(date +%H:%M:%S)] agent-spawn-v2: context manifest ready (${bytes} bytes; $SOURCE_DESC)" >&2
+
+    # Export so agent-spawn knows to mount this in
+    AGENT_SPAWN_CONTEXT_FILE="$MANIFEST_TMP"
+    export AGENT_SPAWN_CONTEXT_FILE
+fi
+
+# Map agent-slot name (agent-01) -> agent-spawn slot arg
+SPAWN_SLOT="${AGENT_SLOT_NAME#agent-}"
+
+agent-spawn "$SPAWN_SLOT" "$AGENT_SLOT_IP" "$PROMPT"

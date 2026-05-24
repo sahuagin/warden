@@ -3,7 +3,7 @@
 # Passes all args through — add -p "prompt" for non-interactive use.
 #
 # Install: cp scripts/agent-gemma ~/.local/bin/ && chmod +x ~/.local/bin/agent-gemma
-OR_KEY=$(cat /home/tcovert/src/claude-openrouter/api-key)
+OR_KEY=$(tq -r openrouter.api-key -f ~/.config/agent/config.toml)
 exec env OPENROUTER_API_KEY="$OR_KEY" \
     /home/tcovert/.npm-packages/bin/pi \
     --provider openrouter \

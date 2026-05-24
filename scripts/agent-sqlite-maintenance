@@ -1,0 +1,72 @@
+#!/bin/sh
+# agent-sqlite-maintenance — weekly integrity check + VACUUM of agent.sqlite
+#
+# Workflow:
+#   1. PRAGMA integrity_check (READ ONLY — runs against the live db, no service stop)
+#   2. If integrity FAIL: tag alert, write a flag file, DO NOT proceed (writes
+#      should pause until human review).
+#   3. If integrity OK: stop worker briefly, VACUUM in-place, restart worker.
+#
+# Per flywheel-up7 (Phase 1.6).
+
+set -e
+
+DB="$HOME/.local/share/agent.sqlite"
+ALERT_FLAG="$HOME/.claude-personal/state/agent-sqlite-INTEGRITY-FAILED"
+mkdir -p "$(dirname "$ALERT_FLAG")"
+
+if [ ! -r "$DB" ]; then
+    echo "agent-sqlite-maintenance: db not found at $DB" >&2
+    exit 1
+fi
+
+# 1. Integrity check (live db; sqlite3 acquires a brief shared lock)
+INTEGRITY=$(sqlite3 "$DB" "PRAGMA integrity_check;" 2>&1)
+if [ "$INTEGRITY" != "ok" ]; then
+    echo "$INTEGRITY" > "$ALERT_FLAG"
+    echo "agent-sqlite-maintenance: INTEGRITY CHECK FAILED — output written to $ALERT_FLAG" >&2
+    if command -v task_log >/dev/null 2>&1; then
+        task_log add --desc "agent-sqlite-maintenance: INTEGRITY FAILED — pause writes" \
+            --result "integrity_check output: $INTEGRITY (full output at $ALERT_FLAG)" \
+            --tags "agent-maintenance,integrity-fail,alert,phase1-6" --status failed >/dev/null 2>&1 || true
+    fi
+    # Do NOT proceed to VACUUM. Human must review.
+    exit 2
+fi
+
+# 2. Integrity OK — proceed with VACUUM. Briefly pause writes.
+SIZE_BEFORE=$(stat -f %z "$DB" 2>/dev/null || stat -c %s "$DB")
+sudo service c137_memory_worker stop >/dev/null 2>&1
+# Worker stop releases the flock from flywheel-txf; sqlite3 has exclusive access.
+if ! sqlite3 "$DB" "VACUUM;" 2>&1; then
+    # Restart worker even on VACUUM failure
+    sudo service c137_memory_worker start >/dev/null 2>&1 || true
+    if command -v task_log >/dev/null 2>&1; then
+        task_log add --desc "agent-sqlite-maintenance: VACUUM failed" \
+            --result "integrity OK, but VACUUM errored. Worker restarted." \
+            --tags "agent-maintenance,vacuum-fail,alert,phase1-6" --status failed >/dev/null 2>&1 || true
+    fi
+    exit 3
+fi
+SIZE_AFTER=$(stat -f %z "$DB" 2>/dev/null || stat -c %s "$DB")
+
+# Restart worker
+sudo service c137_memory_worker start >/dev/null 2>&1
+sleep 2
+# Quick health check
+if ! curl -sS --max-time 3 http://10.1.1.172:37778/api/health | grep -q '"version"'; then
+    if command -v task_log >/dev/null 2>&1; then
+        task_log add --desc "agent-sqlite-maintenance: worker did not come back healthy after restart" \
+            --result "VACUUM completed (before=$SIZE_BEFORE after=$SIZE_AFTER) but post-start /api/health failed" \
+            --tags "agent-maintenance,worker-restart-fail,alert,phase1-6" --status failed >/dev/null 2>&1 || true
+    fi
+    exit 4
+fi
+
+if command -v task_log >/dev/null 2>&1; then
+    task_log add --desc "agent-sqlite-maintenance: vacuum completed" \
+        --result "integrity=ok size_before=$SIZE_BEFORE size_after=$SIZE_AFTER reclaimed=$((SIZE_BEFORE - SIZE_AFTER))" \
+        --tags "agent-maintenance,vacuum-ok,phase1-6" --status completed >/dev/null 2>&1 || true
+fi
+
+echo "agent-sqlite-maintenance: integrity ok; vacuumed (before=$SIZE_BEFORE after=$SIZE_AFTER bytes)"

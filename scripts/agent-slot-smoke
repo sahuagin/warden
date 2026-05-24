@@ -1,0 +1,98 @@
+#!/bin/sh
+# agent-slot-smoke — minimal smoke test for agent-slot/agent-spawn-v2.
+#
+# Validates:
+#   1. etcd reachable
+#   2. /agents/slots/ pool populated
+#   3. acquire returns a free slot atomically
+#   4. release frees the slot
+#   5. concurrent acquires never double-allocate (10-way race)
+#
+# Does NOT spawn pots or call APIs — purely an etcd-side check.
+# Run after agent-slot init, or after a reboot to confirm etcd state intact.
+#
+# Exit: 0 = all green, 1 = any failure
+
+set -e
+ETCD_ENDPOINTS="${AGENT_SLOT_ETCD:-http://127.0.0.1:2379}"
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+ok() { echo "  OK: $*"; }
+
+echo "1. etcd reachable"
+etcdctl --endpoints=$ETCD_ENDPOINTS endpoint health 2>&1 | grep -q "is healthy" \
+    || fail "etcd not healthy at $ETCD_ENDPOINTS"
+ok "etcd healthy"
+
+echo "2. slot pool populated"
+N=$(etcdctl --endpoints=$ETCD_ENDPOINTS get --prefix /agents/slots/ --keys-only 2>/dev/null | grep -c /agents/slots/)
+[ "$N" -ge 2 ] || fail "expected >=2 slots, got $N. Run: agent-slot init"
+ok "found $N slots"
+
+echo "3. baseline: no leases held"
+LEASED=$(etcdctl --endpoints=$ETCD_ENDPOINTS get --prefix /agents/leases/ --keys-only 2>/dev/null | grep -c /agents/leases/ || true)
+[ "$LEASED" -eq 0 ] || fail "expected 0 leases, got $LEASED. Possible orphaned leases — try: agent-slot reap"
+ok "no preexisting leases"
+
+echo "4. acquire+release round-trip"
+out=$(agent-slot acquire smoke-test-1 2>&1) || fail "acquire failed: $out"
+eval "$out"
+[ -n "$AGENT_SLOT_NAME" ] || fail "acquire output missing AGENT_SLOT_NAME"
+ok "acquired $AGENT_SLOT_NAME @ $AGENT_SLOT_IP"
+agent-slot release "$AGENT_SLOT_NAME" >/dev/null 2>&1 || fail "release of $AGENT_SLOT_NAME failed"
+ok "released $AGENT_SLOT_NAME"
+
+echo "5. concurrent acquire race (12 racers, $N slots)"
+RACELOG=$(mktemp)
+# Always release any leases we managed to grab, even on failure.
+cleanup() {
+    rm -f "$RACELOG"
+    for slot in $(etcdctl --endpoints=$ETCD_ENDPOINTS get --prefix /agents/leases/ --keys-only 2>/dev/null \
+                      | grep /agents/leases/ | sed 's|.*/||'); do
+        agent-slot release "$slot" >/dev/null 2>&1 || true
+    done
+}
+trap cleanup EXIT
+for i in $(seq 1 12); do
+    (
+        # Disable set -e in the subshell: acquire returning 1 (no slots
+        # available) is an expected outcome we want to record, not abort on.
+        set +e
+        out=$(agent-slot acquire "smoke-race-$i" 2>&1)
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            slot=$(echo "$out" | sed -n 's/^AGENT_SLOT_NAME=//p')
+            echo "WIN $slot" >> "$RACELOG"
+        else
+            echo "FAIL $i" >> "$RACELOG"
+        fi
+    ) &
+done
+# `wait` propagates the last child's exit status; under set -e we'd exit
+# here whenever any background acquire fails (which is expected in this
+# race). `|| true` lets us proceed to the win/fail count check.
+wait || true
+
+# grep -c returns 1 when there are no matches; under set -e that aborts
+# the script. Force it to 0 instead.
+WINS=$(grep -c "^WIN " "$RACELOG" 2>/dev/null || echo 0)
+FAILS=$(grep -c "^FAIL " "$RACELOG" 2>/dev/null || echo 0)
+UNIQ_SLOTS=$(grep "^WIN " "$RACELOG" 2>/dev/null | awk '{print $2}' | sort -u | wc -l | tr -d ' ')
+EXPECTED_FAILS=$((12 - N))
+[ "$N" -lt 12 ] || EXPECTED_FAILS=0
+
+[ "$WINS" -eq "$N" ] || [ "$WINS" -eq 12 ] || fail "expected $N or 12 wins, got $WINS"
+[ "$UNIQ_SLOTS" -eq "$WINS" ] || fail "double-allocation detected: $WINS wins but only $UNIQ_SLOTS unique slots"
+ok "concurrent race: $WINS won (all unique), $FAILS failed cleanly"
+
+echo "6. release winners"
+for slot in $(etcdctl --endpoints=$ETCD_ENDPOINTS get --prefix /agents/leases/ --keys-only 2>/dev/null \
+                  | grep /agents/leases/ | sed 's|.*/||'); do
+    agent-slot release "$slot" >/dev/null 2>&1 || true
+done
+LEASED=$(etcdctl --endpoints=$ETCD_ENDPOINTS get --prefix /agents/leases/ --keys-only 2>/dev/null | grep -c /agents/leases/ || true)
+[ "$LEASED" -eq 0 ] || fail "after cleanup, $LEASED leases remain"
+ok "all leases released"
+
+echo ""
+echo "smoke test passed."

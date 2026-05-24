@@ -52,9 +52,9 @@ doas /sbin/zfs clone "$SNAP" "$CLONE_DS"
 doas /sbin/zfs set mountpoint="$CLONE_PATH" "$CLONE_DS"
 
 # Create mount targets for things not in the base spline jail
-doas /bin/mkdir -p "${CLONE_PATH}/home/tcovert/.npm-packages"
-doas /bin/mkdir -p "${CLONE_PATH}/home/tcovert/.pi"
-doas /bin/mkdir -p "${CLONE_PATH}/home/tcovert/src/claude-openrouter"
+doas /bin/mkdir -p "${CLONE_PATH}${HOME}/.npm-packages"
+doas /bin/mkdir -p "${CLONE_PATH}${HOME}/.pi"
+doas /bin/mkdir -p "${CLONE_PATH}${HOME}/src/claude-openrouter"
 
 cat > "$CONF_FILE" << EOF
 ${JAIL_NAME} {
@@ -64,17 +64,17 @@ ${JAIL_NAME} {
   exec.stop = "/bin/sh /etc/rc.shutdown";
   mount.devfs;
 
-  mount += "/home/tcovert/.claude ${CLONE_PATH}/home/tcovert/.claude nullfs rw 0 0";
-  mount += "/home/tcovert/.claude.json ${CLONE_PATH}/home/tcovert/.claude.json nullfs rw 0 0";
-  mount += "/home/tcovert/.config/jj ${CLONE_PATH}/home/tcovert/.config/jj nullfs rw 0 0";
-  mount += "/home/tcovert/.config/git ${CLONE_PATH}/home/tcovert/.config/git nullfs rw 0 0";
-  mount += "/home/tcovert/.config/helix ${CLONE_PATH}/home/tcovert/.config/helix nullfs rw 0 0";
-  mount += "/home/tcovert/.gitconfig ${CLONE_PATH}/home/tcovert/.gitconfig nullfs rw 0 0";
-  mount += "/home/tcovert/.ssh ${CLONE_PATH}/home/tcovert/.ssh nullfs ro 0 0";
+  mount += "${HOME}/.claude ${CLONE_PATH}${HOME}/.claude nullfs rw 0 0";
+  mount += "${HOME}/.claude.json ${CLONE_PATH}${HOME}/.claude.json nullfs rw 0 0";
+  mount += "${HOME}/.config/jj ${CLONE_PATH}${HOME}/.config/jj nullfs rw 0 0";
+  mount += "${HOME}/.config/git ${CLONE_PATH}${HOME}/.config/git nullfs rw 0 0";
+  mount += "${HOME}/.config/helix ${CLONE_PATH}${HOME}/.config/helix nullfs rw 0 0";
+  mount += "${HOME}/.gitconfig ${CLONE_PATH}${HOME}/.gitconfig nullfs rw 0 0";
+  mount += "${HOME}/.ssh ${CLONE_PATH}${HOME}/.ssh nullfs ro 0 0";
   mount += "/exports/home ${CLONE_PATH}/exports/home nullfs rw 0 0";
-  mount += "/home/tcovert/.npm-packages ${CLONE_PATH}/home/tcovert/.npm-packages nullfs ro 0 0";
-  mount += "/home/tcovert/.pi ${CLONE_PATH}/home/tcovert/.pi nullfs rw 0 0";
-  mount += "/home/tcovert/src/claude-openrouter ${CLONE_PATH}/home/tcovert/src/claude-openrouter nullfs ro 0 0";
+  mount += "${HOME}/.npm-packages ${CLONE_PATH}${HOME}/.npm-packages nullfs ro 0 0";
+  mount += "${HOME}/.pi ${CLONE_PATH}${HOME}/.pi nullfs rw 0 0";
+  mount += "${HOME}/src/claude-openrouter ${CLONE_PATH}${HOME}/src/claude-openrouter nullfs ro 0 0";
 
   allow.raw_sockets = 1;
   ip4 = inherit;
@@ -90,7 +90,7 @@ echo "==> Changes not pushed will be lost when you exit." >&2
 
 doas /usr/sbin/jexec -U tcovert "$JAIL_NAME" /usr/local/bin/zsh -c \
     'export OPENROUTER_API_KEY=$(cat ~/src/claude-openrouter/api-key)
-     export PATH=$PATH:/home/tcovert/.npm-packages/bin
+     export PATH=$PATH:${HOME}/.npm-packages/bin
      export EDITOR=hx
      export VISUAL=hx
      cd ~/work/spline/jj_lseg

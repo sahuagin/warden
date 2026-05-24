@@ -1,0 +1,123 @@
+#!/bin/sh
+# agent-fanout — parallel sub-agent spawn across multiple slots.
+#
+# Spawns N copies of a prompt in parallel via agent-spawn-v2, collects
+# all stdout into a single output, returns the slowest exit code.
+#
+# Usage:
+#   agent-fanout <N> <prompt>
+#   agent-fanout -p <prompt-file> <N>      # prompt from file (multiline)
+#   agent-fanout -d <dir-of-prompts>       # one prompt per file in dir
+#
+# Output format: each agent's output is prefixed with "[<slot>]" lines so
+# you can tell who said what. Use `--no-prefix` for raw concat.
+#
+# Exit codes:
+#   0     all agents succeeded
+#   1     bad args
+#   2     no slots available for at least one agent
+#   3     at least one agent failed (output still collected)
+#
+# Examples:
+#   # 5 agents, each with the same prompt:
+#   agent-fanout 5 "What's 2+2? Answer in one word."
+#
+#   # Different prompts per agent (one per line in file):
+#   for q in q1 q2 q3; do echo "$q" >> /tmp/qs; done
+#   agent-fanout -d /tmp/qs/  # not yet impl
+
+set -e
+
+NO_PREFIX=0
+PROMPT_FILE=""
+PROMPT_DIR=""
+
+while getopts "p:d:nh" opt; do
+    case "$opt" in
+        p) PROMPT_FILE="$OPTARG" ;;
+        d) PROMPT_DIR="$OPTARG" ;;
+        n) NO_PREFIX=1 ;;
+        h)
+            sed -n '/^# agent-fanout/,/^$/p' "$0" | sed 's/^# \?//'
+            exit 0
+            ;;
+        *) exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+# Collect (N, prompt) pairs to dispatch
+TMPDIR=$(mktemp -d)
+cleanup_fanout() { rm -rf "$TMPDIR"; }
+trap cleanup_fanout EXIT INT TERM
+
+if [ -n "$PROMPT_DIR" ]; then
+    # one prompt per file in dir
+    i=0
+    for f in "$PROMPT_DIR"/*; do
+        [ -f "$f" ] || continue
+        i=$((i + 1))
+        cp "$f" "$TMPDIR/prompt-$i"
+    done
+    N=$i
+elif [ -n "$PROMPT_FILE" ]; then
+    N="$1"
+    if [ -z "$N" ]; then
+        echo "Usage: agent-fanout -p <file> <N>" >&2
+        exit 1
+    fi
+    for i in $(seq 1 "$N"); do
+        cp "$PROMPT_FILE" "$TMPDIR/prompt-$i"
+    done
+else
+    N="$1"
+    PROMPT="$2"
+    if [ -z "$N" ] || [ -z "$PROMPT" ]; then
+        echo "Usage: agent-fanout <N> <prompt>" >&2
+        exit 1
+    fi
+    for i in $(seq 1 "$N"); do
+        printf '%s' "$PROMPT" > "$TMPDIR/prompt-$i"
+    done
+fi
+
+echo "[fanout] dispatching $N agents in parallel" >&2
+
+# Launch each agent in background, capture each output to TMPDIR/out-N
+i=0
+for f in "$TMPDIR"/prompt-*; do
+    i=$((i + 1))
+    n=$(echo "$f" | sed 's/.*-//')
+    (
+        set +e  # let agent-spawn-v2's exit code surface, don't propagate
+        prompt=$(cat "$f")
+        agent-spawn-v2 -t "fanout-$n" "$prompt" > "$TMPDIR/out-$n" 2> "$TMPDIR/err-$n"
+        echo $? > "$TMPDIR/rc-$n"
+    ) &
+done
+wait || true
+
+# Collect results
+overall_rc=0
+for n in $(seq 1 "$N"); do
+    rc=$(cat "$TMPDIR/rc-$n" 2>/dev/null || echo 99)
+    # Try to extract the spawning slot from the stderr (agent-spawn-v2 prints
+    # "acquired slot agent-NN @ ...")
+    slot=$(grep -o 'acquired slot agent-[0-9]*' "$TMPDIR/err-$n" 2>/dev/null | head -1 | awk '{print $3}')
+    [ -z "$slot" ] && slot="agent-?"
+
+    if [ "$NO_PREFIX" -eq 1 ]; then
+        cat "$TMPDIR/out-$n"
+    else
+        # Prefix each output line with the slot
+        sed "s|^|[$slot] |" "$TMPDIR/out-$n"
+    fi
+
+    if [ "$rc" -ne 0 ]; then
+        overall_rc=3
+        echo "[$slot] FAILED rc=$rc:" >&2
+        sed 's/^/  /' "$TMPDIR/err-$n" >&2
+    fi
+done
+
+exit "$overall_rc"

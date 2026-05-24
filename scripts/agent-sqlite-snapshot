@@ -1,0 +1,53 @@
+#!/bin/sh
+# agent-sqlite-snapshot — nightly ZFS snapshot covering ~/.local/share/agent.sqlite
+#
+# Snapshots zroot/home (the dataset containing /home, where ~/.local/share/ lives).
+# Uses a copy-on-write snapshot; near-zero space cost when the underlying data
+# isn't churning. Prunes snapshots older than 14 days.
+#
+# Per flywheel-up7 (Phase 1.6).
+
+set -e
+
+DATASET="zroot/home"
+TAG="agent-nightly"
+DATE_STR=$(date +%Y-%m-%d)
+SNAP="${DATASET}@${TAG}-${DATE_STR}"
+RETENTION_DAYS=14
+
+# Already exists for today? Skip silently.
+if sudo zfs list -t snapshot -H -o name "$SNAP" >/dev/null 2>&1; then
+    if command -v task_log >/dev/null 2>&1; then
+        task_log add --desc "agent-sqlite-snapshot: skipped (today's snapshot already exists)" \
+            --result "snap=$SNAP" --tags "agent-snapshot,skipped,phase1-6" --status completed >/dev/null 2>&1 || true
+    fi
+    exit 0
+fi
+
+# Take the snapshot
+if ! sudo zfs snapshot "$SNAP"; then
+    if command -v task_log >/dev/null 2>&1; then
+        task_log add --desc "agent-sqlite-snapshot: FAILED" \
+            --result "could not create snapshot $SNAP" \
+            --tags "agent-snapshot,error,alert,phase1-6" --status failed >/dev/null 2>&1 || true
+    fi
+    exit 1
+fi
+
+# Prune snapshots with our tag older than RETENTION_DAYS days.
+# We list snapshots with creation timestamps, compare to cutoff (epoch).
+CUTOFF=$(date -v-"${RETENTION_DAYS}d" +%s 2>/dev/null || date -d "-${RETENTION_DAYS} days" +%s)
+PRUNED=0
+sudo zfs list -t snapshot -H -o name,creation -p "$DATASET" 2>/dev/null \
+    | awk -v t="$TAG" -v c="$CUTOFF" '$1 ~ ("@"t"-") && $2+0 < c {print $1}' \
+    | while read -r OLD; do
+        sudo zfs destroy "$OLD" 2>/dev/null && PRUNED=$((PRUNED + 1)) || true
+    done
+
+if command -v task_log >/dev/null 2>&1; then
+    task_log add --desc "agent-sqlite-snapshot: created" \
+        --result "snap=$SNAP retention_days=$RETENTION_DAYS" \
+        --tags "agent-snapshot,success,phase1-6" --status completed >/dev/null 2>&1 || true
+fi
+
+echo "agent-sqlite-snapshot: created $SNAP"

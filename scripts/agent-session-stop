@@ -1,0 +1,6 @@
+#!/bin/sh
+# Stop hook: surface in-progress tasks so they don't get lost mid-session.
+RESUME=$(~/.local/bin/agent task resume 2>/dev/null)
+if [ -n "$RESUME" ] && [ "$RESUME" != "(no resumable tasks)" ]; then
+    printf "\n=== In-Progress Tasks ===\n%s\n" "$RESUME"
+fi

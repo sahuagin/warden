@@ -1,0 +1,148 @@
+#!/bin/sh
+# agent-spawn — minimal v1 wrapper for spawning pi sub-agents in pot clones.
+#
+# Usage:
+#   agent-spawn <slot-name> <ip> <prompt>
+#
+# Example:
+#   agent-spawn agent-1 10.1.1.201 "List the files in /tmp using bash."
+#
+# Behavior:
+#   1. Clones agent-runtime template -> agent-<slot-name> at <ip>
+#   2. Configures DNS (10.1.1.1)
+#   3. Starts pot
+#   4. Runs pi --mode json -p with the prompt + OpenRouter creds (JSONL output)
+#   5. Captures pi stdout to a temp file
+#   6. Stops + destroys the pot (idempotent on failure)
+#   7. Prints captured output to stdout
+#
+# Exit codes:
+#   0   success
+#   1   bad arguments
+#   2   pot clone failed
+#   3   pot start failed
+#   4   pi invocation failed
+#   5   teardown had errors (output may still be valid)
+#
+# Environment variables read:
+#   AGENT_SPAWN_MODEL      — pi --model arg (default: deepseek/deepseek-v4-flash)
+#   AGENT_SPAWN_PROVIDER   — pi --provider arg (default: openrouter)
+#   AGENT_SPAWN_TIMEOUT    — seconds to wait for pi (default: 120)
+#
+# Notes:
+#   - Requires doas /bin/sh on the nopass list (already configured for ${USER})
+#   - Reads OpenRouter key from ~/.config/agent/config.toml
+#   - Sub-agent's pi invocation is single-turn (no -i interactive mode)
+#   - Slot name conflicts (already-running pot) are not detected; caller
+#     responsibility to pick unique names
+
+set -e
+
+SLOT="$1"
+IP="$2"
+PROMPT="$3"
+
+if [ -z "$SLOT" ] || [ -z "$IP" ] || [ -z "$PROMPT" ]; then
+    echo "Usage: agent-spawn <slot-name> <ip> <prompt>" >&2
+    exit 1
+fi
+
+POT_NAME="agent-$SLOT"
+MODEL="${AGENT_SPAWN_MODEL:-deepseek/deepseek-v4-flash}"
+PROVIDER="${AGENT_SPAWN_PROVIDER:-openrouter}"
+TIMEOUT="${AGENT_SPAWN_TIMEOUT:-180}"
+
+# Extract API keys from agent config.toml
+OR_KEY=$(awk '/^\[openrouter\]/{f=1} f && /^api_key/{gsub(/[" ]/,""); split($0, a, "="); print a[2]; exit}' ~/.config/agent/config.toml | sed 's/#.*//')
+ANT_KEY=$(awk '/^\[anthropic\]/{f=1} f && /^api_key/{gsub(/[" ]/,""); split($0, a, "="); print a[2]; exit}' ~/.config/agent/config.toml)
+
+if [ -z "$OR_KEY" ] && [ -z "$ANT_KEY" ]; then
+    echo "agent-spawn: could not read any api_key from ~/.config/agent/config.toml" >&2
+    exit 1
+fi
+
+OUTPUT_FILE=$(mktemp /tmp/agent-spawn.XXXXXX)
+TEARDOWN_LOG=$(mktemp /tmp/agent-spawn-teardown.XXXXXX)
+
+teardown() {
+    {
+        doas /bin/sh -c "pot stop $POT_NAME 2>&1 || true"
+        doas /bin/sh -c "pot destroy -p $POT_NAME 2>&1 || true"
+    } > "$TEARDOWN_LOG" 2>&1
+}
+
+# Ensure teardown happens on any exit
+trap 'teardown' EXIT INT TERM
+
+echo "[$(date +%H:%M:%S)] agent-spawn: cloning agent-runtime -> $POT_NAME @ $IP" >&2
+
+if ! doas /bin/sh -c "pot clone -p $POT_NAME -P agent-runtime -i $IP -d off 2>&1"; then
+    echo "agent-spawn: clone failed" >&2
+    exit 2
+fi
+
+# Pre-stage DNS into clone before starting (resolv.conf gets written to /etc/resolv.conf)
+doas /bin/sh -c "echo 'nameserver 10.1.1.1' > /opt/pot/jails/$POT_NAME/m/etc/resolv.conf"
+
+echo "[$(date +%H:%M:%S)] agent-spawn: starting $POT_NAME" >&2
+
+# Redirect pot's banner ("Starting syslogd...", "Updating motd:.", etc.)
+# to stderr so it doesn't pollute the agent's stdout output.
+if ! doas /bin/sh -c "pot start $POT_NAME 2>&1" >&2; then
+    echo "agent-spawn: start failed" >&2
+    exit 3
+fi
+
+# Pre-stage DNS (pot rewrites it on start; do it again post-start)
+doas /bin/sh -c "echo 'nameserver 10.1.1.1' > /opt/pot/jails/$POT_NAME/m/etc/resolv.conf"
+
+# Phase 1.3 (flywheel-p2w): if a context manifest was prepared by agent-spawn-v2,
+# stage it inside the pot at /var/run/agent/context_cache.txt and ask pi to
+# load it as a system-prompt extension via --append-system-prompt.
+APPEND_SYS_PROMPT_FLAG=""
+if [ -n "${AGENT_SPAWN_CONTEXT_FILE:-}" ] && [ -r "$AGENT_SPAWN_CONTEXT_FILE" ]; then
+    doas /bin/sh -c "mkdir -p /opt/pot/jails/$POT_NAME/m/var/run/agent && \
+        cp '$AGENT_SPAWN_CONTEXT_FILE' /opt/pot/jails/$POT_NAME/m/var/run/agent/context_cache.txt && \
+        chmod 0644 /opt/pot/jails/$POT_NAME/m/var/run/agent/context_cache.txt"
+    APPEND_SYS_PROMPT_FLAG="--append-system-prompt /var/run/agent/context_cache.txt"
+    echo "[$(date +%H:%M:%S)] agent-spawn: staged context manifest into pot ($(wc -c < "$AGENT_SPAWN_CONTEXT_FILE") bytes)" >&2
+fi
+
+echo "[$(date +%H:%M:%S)] agent-spawn: invoking pi (model=$MODEL provider=$PROVIDER timeout=${TIMEOUT}s)" >&2
+
+# Escape single quotes in prompt for embedding in doas /bin/sh -c '...'
+# We use base64 to pass the prompt safely without quoting headaches
+PROMPT_B64=$(printf '%s' "$PROMPT" | base64 | tr -d '\n')
+
+# Disable set -e for the pi invocation — non-zero exit (e.g. timeout=124)
+# is expected information we want to surface, not a fatal error.
+set +e
+doas /bin/sh -c "
+    PROMPT_DECODED=\$(echo '$PROMPT_B64' | base64 -d)
+    timeout $TIMEOUT jexec $POT_NAME env \
+        OPENROUTER_API_KEY=$OR_KEY \
+        ANTHROPIC_API_KEY=$ANT_KEY \
+        C137_MEM_HOST=10.1.1.172 \
+        PI_HTTP_ALLOW_PRIVATE=1 \
+        PI_HTTP_ALLOW_LOOPBACK=1 \
+        /usr/local/bin/pi --provider $PROVIDER --model $MODEL --mode json $APPEND_SYS_PROMPT_FLAG -p \"\$PROMPT_DECODED\" 2>&1
+" > "$OUTPUT_FILE" 2>&1
+
+PI_EXIT=$?
+set -e
+
+echo "[$(date +%H:%M:%S)] agent-spawn: pi exit=$PI_EXIT, output bytes=$(wc -c < "$OUTPUT_FILE")" >&2
+
+if [ "$PI_EXIT" -ne 0 ]; then
+    echo "agent-spawn: pi invocation failed (exit $PI_EXIT)" >&2
+    cat "$OUTPUT_FILE" >&2
+    rm -f "$OUTPUT_FILE"
+    exit 4
+fi
+
+# Strip the c137-mem TLS-error noise from output (known issue, separate concern)
+grep -v 'c137-mem.*TLS required' "$OUTPUT_FILE" | grep -v 'agent-runtime' || cat "$OUTPUT_FILE"
+rm -f "$OUTPUT_FILE"
+
+# Teardown happens via trap
+exit 0
