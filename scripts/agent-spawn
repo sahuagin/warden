@@ -111,15 +111,16 @@ if [ "$AGENT_SPAWN_USER" = "root" ]; then
 fi
 
 case "$RUNTIME" in
-    mu|pi|claude) ;;
-    *) echo "agent-spawn: AGENT_SPAWN_RUNTIME must be 'mu', 'pi', or 'claude' (got: $RUNTIME)" >&2; exit 1 ;;
+    mu|pi|claude|mu-slat) ;;
+    *) echo "agent-spawn: AGENT_SPAWN_RUNTIME must be 'mu', 'pi', 'claude', or 'mu-slat' (got: $RUNTIME)" >&2; exit 1 ;;
 esac
 
-# Extract API keys from agent config.toml
+# Extract API keys from agent config.toml (not needed for mu-slat which uses
+# stored credentials, but required for mu/pi/claude runtimes).
 OR_KEY=$(awk '/^\[openrouter\]/{f=1} f && /^api_key/{gsub(/[" ]/,""); split($0, a, "="); print a[2]; exit}' ~/.config/agent/config.toml | sed 's/#.*//')
 ANT_KEY=$(awk '/^\[anthropic\]/{f=1} f && /^api_key/{gsub(/[" ]/,""); split($0, a, "="); print a[2]; exit}' ~/.config/agent/config.toml)
 
-if [ -z "$OR_KEY" ] && [ -z "$ANT_KEY" ]; then
+if [ "$RUNTIME" != "mu-slat" ] && [ -z "$OR_KEY" ] && [ -z "$ANT_KEY" ]; then
     echo "agent-spawn: could not read any api_key from ~/.config/agent/config.toml" >&2
     exit 1
 fi
@@ -273,6 +274,55 @@ elif [ "$RUNTIME" = "claude" ]; then
             CLAUDE_CODE_OAUTH_TOKEN=\"\$TOKEN_DECODED\" \
             IS_SANDBOX=1 \
             /usr/local/bin/claude -p --dangerously-skip-permissions $CLAUDE_ADD_DIR_ARGS \"\$PROMPT_DECODED\" </dev/null 2>&1
+    " > "$OUTPUT_FILE" 2>&1
+elif [ "$RUNTIME" = "mu-slat" ]; then
+    # mu-slat: interactive claude with MCP mailbox — subscription billing.
+    #
+    # Unlike the 'claude' runtime above (which uses -p for headless dispatch
+    # to sdk-cli entrypoint → credit pool), mu-slat spawns claude WITHOUT -p
+    # so entrypoint=cli → subscription billing. The worker stays running as
+    # an interactive session and communicates with the mu daemon via MCP
+    # mailbox tools over a unix socket bridge.
+    #
+    # Auth: uses stored .credentials.json via the nullfs-mounted
+    # ~/.claude-personal dir (template fscomp.conf). Does NOT use the
+    # headless OAuth token — that blocks remote control (memory a62b2f99).
+    #
+    # Env vars from the caller (mu's worker.rs):
+    #   MU_DAEMON_ID   — daemon to coordinate with
+    #   MU_SESSION_ID  — this worker's session ID in mu's registry
+    #   MU_POT_NAME    — pot name (for self-identification)
+    #   MU_MCP_CONFIG  — path to MCP config JSON (inside pot, shared /tmp)
+    #   MU_SYSTEM_PROMPT — path to system prompt appendix (inside pot)
+    #
+    # The MCP config + system prompt files must be written to the pot's
+    # shared /tmp BEFORE this jexec runs. The caller (mu worker.rs or
+    # agent-spawn-v2 wrapper) handles that.
+    MU_DAEMON_ID="${MU_DAEMON_ID:-unknown}"
+    MU_SESSION_ID="${MU_SESSION_ID:-unknown}"
+    MU_MCP_CONFIG="${MU_MCP_CONFIG:-/compat/linux/tmp/mu-mcp-${POT_NAME}.json}"
+    MU_SYSTEM_PROMPT="${MU_SYSTEM_PROMPT:-/var/run/agent/context_cache.txt}"
+    MU_SLAT_MODEL="${AGENT_SPAWN_MODEL:-claude-opus-4-7}"
+
+    MCP_CONFIG_FLAG=""
+    if [ -f "/opt/pot/jails/$POT_NAME/m${MU_MCP_CONFIG}" ] || [ -f "/tmp/mu-mcp-${POT_NAME}.json" ]; then
+        MCP_CONFIG_FLAG="--mcp-config $MU_MCP_CONFIG"
+    fi
+
+    doas /bin/sh -c "
+        timeout $TIMEOUT jexec $JEXEC_USER_FLAG -l $POT_NAME env \
+            -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL -u CLAUDE_CODE_OAUTH_TOKEN \
+            HOME=$HOME_DIR \
+            LANG=C.UTF-8 \
+            CLAUDE_CONFIG_DIR=$HOME_DIR/.claude-personal \
+            MU_DAEMON_ID=$MU_DAEMON_ID \
+            MU_SESSION_ID=$MU_SESSION_ID \
+            MU_POT_NAME=$POT_NAME \
+            /usr/local/bin/claude \
+                --dangerously-skip-permissions \
+                --model $MU_SLAT_MODEL \
+                $MCP_CONFIG_FLAG \
+                $APPEND_SYS_PROMPT_FLAG
     " > "$OUTPUT_FILE" 2>&1
 else
     # pi runtime — legacy rollback path. Same env shape as before;
