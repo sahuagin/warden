@@ -1,0 +1,103 @@
+#!/bin/sh
+# agent-slot-session-smoke — smoke test for agent-slot's session-identity verbs.
+#
+# Validates the UNBOUNDED session namespace (/claude/sessions/<name>), distinct
+# from the fixed compute-slot pool exercised by agent-slot-smoke:
+#   1. etcd reachable
+#   2. register creates a unique name + lease; output is eval-able
+#   3. sessions lists it with a live TTL
+#   4. re-register by the SAME owner is idempotent (refresh, rc=0)
+#   5. register/renew/unregister by a DIFFERENT owner is REFUSED (mutual excl.)
+#   6. renew by the owner succeeds; renew of an unknown name fails
+#   7. unregister by the owner frees the name; key is gone afterwards
+#
+# Uses a throwaway name under /claude/sessions/ and cleans up on exit. Drives
+# ownership via AGENT_SESSION_OWNER so it never depends on a real session id.
+#
+# Exit: 0 = all green, 1 = any failure
+
+set -e
+ETCD_ENDPOINTS="${AGENT_SLOT_ETCD:-http://127.0.0.1:2379}"
+SLOT="$(dirname "$0")/agent-slot"
+[ -x "$SLOT" ] || SLOT="agent-slot"   # fall back to PATH if not colocated
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+ok() { echo "  OK: $*"; }
+
+NAME="smoke-session-$$"
+ME="smoke-owner-A-$$"
+OTHER="smoke-owner-B-$$"
+KEY="/claude/sessions/$NAME"
+
+cleanup() {
+    # Force-remove the test key regardless of owner so a mid-test abort leaves
+    # no residue. Belt-and-suspenders: direct etcd del too.
+    AGENT_SESSION_OWNER="$ME" "$SLOT" unregister "$NAME" --force >/dev/null 2>&1 || true
+    etcdctl --endpoints=$ETCD_ENDPOINTS del "$KEY" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+echo "1. etcd reachable"
+etcdctl --endpoints=$ETCD_ENDPOINTS endpoint health 2>&1 | grep -q "is healthy" \
+    || fail "etcd not healthy at $ETCD_ENDPOINTS"
+ok "etcd healthy"
+
+echo "2. name is free to start"
+[ -z "$(etcdctl --endpoints=$ETCD_ENDPOINTS get "$KEY" --print-value-only 2>/dev/null)" ] \
+    || fail "$KEY already exists before the test"
+ok "$NAME free"
+
+echo "3. register (create) as owner A"
+out=$(AGENT_SESSION_OWNER="$ME" "$SLOT" register "$NAME" 2>&1) || fail "register failed: $out"
+eval "$out"
+[ "$AGENT_SESSION_NAME" = "$NAME" ] || fail "register output missing/!= AGENT_SESSION_NAME"
+[ -n "$AGENT_SESSION_LEASE" ] || fail "register output missing AGENT_SESSION_LEASE"
+ok "registered $AGENT_SESSION_NAME (lease $AGENT_SESSION_LEASE, ttl $AGENT_SESSION_TTL)"
+
+echo "4. sessions lists it with a live TTL"
+AGENT_SESSION_OWNER="$ME" "$SLOT" sessions | grep -q "$NAME" || fail "sessions did not list $NAME"
+ok "sessions shows $NAME"
+
+echo "5. re-register by SAME owner is idempotent (rc=0)"
+AGENT_SESSION_OWNER="$ME" "$SLOT" register "$NAME" >/dev/null 2>&1 \
+    || fail "idempotent re-register by owner should succeed"
+ok "same-owner re-register accepted"
+
+echo "6. register by DIFFERENT owner is REFUSED"
+if AGENT_SESSION_OWNER="$OTHER" "$SLOT" register "$NAME" >/dev/null 2>&1; then
+    fail "register by a different owner should have been refused"
+fi
+ok "contending register refused"
+
+echo "7. renew by DIFFERENT owner is REFUSED"
+if AGENT_SESSION_OWNER="$OTHER" "$SLOT" renew "$NAME" >/dev/null 2>&1; then
+    fail "renew by a different owner should have been refused"
+fi
+ok "contending renew refused"
+
+echo "8. unregister by DIFFERENT owner (no --force) is REFUSED"
+if AGENT_SESSION_OWNER="$OTHER" "$SLOT" unregister "$NAME" >/dev/null 2>&1; then
+    fail "unregister by a different owner should have been refused"
+fi
+ok "contending unregister refused"
+
+echo "9. renew by the owner succeeds"
+AGENT_SESSION_OWNER="$ME" "$SLOT" renew "$NAME" >/dev/null 2>&1 \
+    || fail "renew by owner should succeed"
+ok "owner renew accepted"
+
+echo "10. renew of an UNKNOWN name fails"
+if AGENT_SESSION_OWNER="$ME" "$SLOT" renew "no-such-$NAME" >/dev/null 2>&1; then
+    fail "renew of an unregistered name should fail"
+fi
+ok "renew of unknown name rejected"
+
+echo "11. unregister by the owner frees the name"
+AGENT_SESSION_OWNER="$ME" "$SLOT" unregister "$NAME" >/dev/null 2>&1 \
+    || fail "owner unregister should succeed"
+[ -z "$(etcdctl --endpoints=$ETCD_ENDPOINTS get "$KEY" --print-value-only 2>/dev/null)" ] \
+    || fail "$KEY still present after unregister"
+ok "$NAME freed; key gone"
+
+echo ""
+echo "session smoke test passed."
